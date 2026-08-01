@@ -3,6 +3,7 @@
 
 #include <windows.h>
 #include <commctrl.h>
+#include <shellapi.h>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -90,11 +91,13 @@ private:
     static LRESULT CALLBACK editProc(HWND, UINT, WPARAM, LPARAM);
     static LRESULT CALLBACK settingsProc(HWND, UINT, WPARAM, LPARAM);
     static LRESULT CALLBACK searchPopupProc(HWND, UINT, WPARAM, LPARAM);
+    static LRESULT CALLBACK nppProc(HWND, UINT, WPARAM, LPARAM);
 
     LRESULT handleMessage(HWND, UINT, WPARAM, LPARAM);
     LRESULT handleEditMessage(HWND, UINT, WPARAM, LPARAM);
     LRESULT handleSettingsMessage(HWND, UINT, WPARAM, LPARAM);
     LRESULT handleSearchPopupMessage(HWND, UINT, WPARAM, LPARAM);
+    LRESULT handleNppMessage(HWND, UINT, WPARAM, LPARAM);
 
     void createWindow();
     void createControls();
@@ -137,6 +140,8 @@ private:
     void layoutSearchPopup();
     void searchDirectory(const std::filesystem::path& root, const std::wstring& query,
                          std::vector<SearchResult>& results, size_t limit) const;
+    bool fileContainsText(const std::filesystem::path& file, const std::wstring& query) const;
+    void addDroppedFolders(HDROP drop);
     static int fuzzyScore(const std::wstring& query, const std::wstring& candidate);
     static std::wstring lower(std::wstring value);
 
@@ -159,6 +164,7 @@ private:
     void syncNativeFolderWorkspace();
 
     HWND _npp{};
+    WNDPROC _oldNppProc{};
     HWND _window{};
     HWND _title{};
     HWND _search{};

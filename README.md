@@ -1,4 +1,4 @@
-﻿# NPPWorkSpace
+# NPPWorkSpace
 
 Plugin para Notepad++ que fornece um workspace próprio com árvore de pastas, subpastas, arquivos e pesquisa rápida.
 
@@ -29,3 +29,12 @@ O projeto é compilado explicitamente em UTF-8 no MSVC (`/utf-8`) e os arquivos 
 - O painel nativo é mantido oculto e o NPPWorkSpace passa a ser a fonte de verdade das pastas.
 - Os botões do painel usam símbolos compactos e tooltips para manter a interface limpa e semelhante aos controles nativos do Notepad++.
 - A busca Ctrl+P continua sendo um popup flutuante e fecha automaticamente quando perde a ativação (clique fora), além de Esc.
+
+
+### Pesquisa por conteúdo
+
+No campo de pesquisa, use `>texto` para procurar o texto dentro de arquivos suportados (`.ini`, `.txt`, `.cfg`, `.xml`, `.json`, código-fonte e outros formatos de texto). A pesquisa é sem diferenciação entre maiúsculas/minúsculas.
+
+### Arrastar pastas
+
+Pastas arrastadas diretamente para o Notepad++ são capturadas pelo NPPWorkSpace e adicionadas como raízes do workspace. O painel nativo Folder as Workspace é ocultado para evitar duplicidade.

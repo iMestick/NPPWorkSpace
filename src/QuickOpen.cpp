@@ -7,6 +7,7 @@
 #include <locale>
 #include <fstream>
 #include <functional>
+#include <array>
 #include <iterator>
 #include <system_error>
 #include <shellapi.h>
@@ -144,6 +145,10 @@ void QuickOpen::initialize(HWND nppHandle)
 
     loadSettings();
     createWindow();
+    if (_npp) {
+        DragAcceptFiles(_npp, TRUE);
+        _oldNppProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(_npp, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&QuickOpen::nppProc)));
+    }
     refreshWorkspace();
     disableNativeFolderWorkspace();
 }
@@ -171,6 +176,11 @@ void QuickOpen::destroy()
         _searchPopup = nullptr;
         _searchPopupEdit = nullptr;
         _searchPopupResults = nullptr;
+    }
+
+    if (_npp && _oldNppProc) {
+        SetWindowLongPtrW(_npp, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(_oldNppProc));
+        _oldNppProc = nullptr;
     }
 
     unregisterDock();
@@ -283,25 +293,25 @@ void QuickOpen::createControls()
         8, 66, 420, 52, _window, reinterpret_cast<HMENU>(ID_WORKSPACE_GROUP),
         GetModuleHandleW(nullptr), nullptr);
 
-    _addFolder = CreateWindowExW(0, L"BUTTON", L"＋",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER | BS_FLAT,
-        18, 86, 105, 26, _window, reinterpret_cast<HMENU>(ID_ADD),
+    _addFolder = CreateWindowExW(0, L"BUTTON", L"+",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER,
+        18, 86, 32, 28, _window, reinterpret_cast<HMENU>(ID_ADD),
         GetModuleHandleW(nullptr), nullptr);
     _newWorkspace = CreateWindowExW(0, L"BUTTON", L"□",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER | BS_FLAT,
-        128, 86, 65, 26, _window, reinterpret_cast<HMENU>(ID_NEW),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER,
+        54, 86, 32, 28, _window, reinterpret_cast<HMENU>(ID_NEW),
         GetModuleHandleW(nullptr), nullptr);
-    _saveWorkspace = CreateWindowExW(0, L"BUTTON", L"↓",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER | BS_FLAT,
-        198, 86, 65, 26, _window, reinterpret_cast<HMENU>(ID_SAVE),
+    _saveWorkspace = CreateWindowExW(0, L"BUTTON", L"↧",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER,
+        90, 86, 32, 28, _window, reinterpret_cast<HMENU>(ID_SAVE),
         GetModuleHandleW(nullptr), nullptr);
     _removeFolder = CreateWindowExW(0, L"BUTTON", L"−",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER | BS_FLAT,
-        268, 86, 75, 26, _window, reinterpret_cast<HMENU>(ID_REMOVE),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER,
+        126, 86, 32, 28, _window, reinterpret_cast<HMENU>(ID_REMOVE),
         GetModuleHandleW(nullptr), nullptr);
     _settings = CreateWindowExW(0, L"BUTTON", L"⚙",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER | BS_FLAT,
-        348, 86, 72, 26, _window, reinterpret_cast<HMENU>(ID_SETTINGS),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER,
+        162, 86, 32, 28, _window, reinterpret_cast<HMENU>(ID_SETTINGS),
         GetModuleHandleW(nullptr), nullptr);
 
     _tree = CreateWindowExW(WS_EX_CLIENTEDGE, WC_TREEVIEWW, L"",
@@ -326,7 +336,7 @@ void QuickOpen::createControls()
         SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(_font), TRUE);
 
     SendMessageW(_search, EM_SETCUEBANNER, TRUE,
-                 reinterpret_cast<LPARAM>(L"Pesquisar arquivos no workspace..."));
+                 reinterpret_cast<LPARAM>(L"Pesquisar arquivos...  (use >texto para pesquisar dentro dos arquivos)"));
 
     createTooltips();
 
@@ -429,34 +439,32 @@ void QuickOpen::syncNativeFolderWorkspace()
 void QuickOpen::layoutControls(int width, int height)
 {
     if (!_window) return;
+    const int minWidth = 250;
+    const int minHeight = 220;
+    width = (std::max)(minWidth, width);
+    height = (std::max)(minHeight, height);
+
     const int pad = 8;
     const int searchGroupH = 58;
     const int workspaceGroupY = 64;
     const int workspaceGroupH = 58;
     const int contentY = 128;
     const int statusH = 22;
-    const int contentH = std::max(80, height - contentY - statusH - 6);
+    const int contentH = (std::max)(60, height - contentY - statusH - 6);
 
     MoveWindow(_searchGroup, pad, 4, width - 2 * pad, searchGroupH, TRUE);
     MoveWindow(_search, pad + 10, 24, width - 2 * pad - 20, 26, TRUE);
     MoveWindow(_workspaceGroup, pad, workspaceGroupY, width - 2 * pad, workspaceGroupH, TRUE);
 
-    const int y = 84;
-    const int h = 26;
-    const int gap = 5;
-    const int available = std::max(300, width - 2 * pad - 20);
+    constexpr int buttonSize = 32;
+    constexpr int gap = 5;
+    const int buttonY = 82;
     int x = pad + 10;
-    const int settingsW = 86;
-    const int removeW = 78;
-    const int saveW = 68;
-    const int newW = 65;
-    const int addW = std::max(90, available - (settingsW + removeW + saveW + newW + 4 * gap));
-    const int widths[] = {addW, newW, saveW, removeW, settingsW};
     HWND buttons[] = {_addFolder, _newWorkspace, _saveWorkspace, _removeFolder, _settings};
-    for (int i = 0; i < 5; ++i)
+    for (HWND button : buttons)
     {
-        MoveWindow(buttons[i], x, y, widths[i], h, TRUE);
-        x += widths[i] + gap;
+        MoveWindow(button, x, buttonY, buttonSize, 30, TRUE);
+        x += buttonSize + gap;
     }
 
     MoveWindow(_tree, pad, contentY, width - 2 * pad, contentH, TRUE);
@@ -524,7 +532,7 @@ void QuickOpen::createSearchPopup()
         GetModuleHandleW(nullptr), nullptr);
     SendMessageW(_searchPopupEdit, WM_SETFONT, reinterpret_cast<WPARAM>(_font), TRUE);
     SendMessageW(_searchPopupEdit, EM_SETCUEBANNER, TRUE,
-                 reinterpret_cast<LPARAM>(L"Digite o nome do arquivo ou pasta..."));
+                 reinterpret_cast<LPARAM>(L"Nome do arquivo/pasta ou >texto para pesquisar dentro dos arquivos..."));
 
     _searchPopupResults = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
         WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
@@ -569,6 +577,10 @@ void QuickOpen::showSearchPopup()
 {
     createSearchPopup();
     if (!_searchPopup) return;
+    // Every Ctrl+P invocation starts a fresh search.
+    if (_searchPopupEdit) SetWindowTextW(_searchPopupEdit, L"");
+    if (_searchPopupResults) ListView_DeleteAllItems(_searchPopupResults);
+    _searchResults.clear();
     layoutSearchPopup();
     RECT npp{};
     GetWindowRect(_npp, &npp);
@@ -607,8 +619,9 @@ void QuickOpen::showPopupSearchResults(const std::wstring& query)
     }
     std::sort(found.begin(), found.end(), [&](const SearchResult& a, const SearchResult& b)
     {
-        const int as = std::max(fuzzyScore(query, a.path.filename().wstring()), fuzzyScore(query, a.relative));
-        const int bs = std::max(fuzzyScore(query, b.path.filename().wstring()), fuzzyScore(query, b.relative));
+        if (!query.empty() && query.front() == L'>') return lower(a.relative) < lower(b.relative);
+        const int as = (std::max)(fuzzyScore(query, a.path.filename().wstring()), fuzzyScore(query, a.relative));
+        const int bs = (std::max)(fuzzyScore(query, b.path.filename().wstring()), fuzzyScore(query, b.relative));
         if (as != bs) return as > bs;
         return lower(a.relative) < lower(b.relative);
     });
@@ -947,9 +960,76 @@ void QuickOpen::searchDirectory(const std::filesystem::path& root, const std::ws
         const std::wstring file = p.filename().wstring();
         std::error_code relEc;
         const std::wstring rel = std::filesystem::relative(p, root, relEc).wstring();
-        if (fuzzyScore(query, file) >= 0 || fuzzyScore(query, rel) >= 0)
-            results.push_back({p, relEc ? p.wstring() : rel});
+        bool match = false;
+        if (!query.empty() && query.front() == L'>')
+        {
+            const std::wstring contentQuery = query.substr(1);
+            match = !contentQuery.empty() && fileContainsText(p, contentQuery);
+        }
+        else
+        {
+            match = fuzzyScore(query, file) >= 0 || fuzzyScore(query, rel) >= 0;
+        }
+        if (match) results.push_back({p, relEc ? p.wstring() : rel});
     }
+}
+
+bool QuickOpen::fileContainsText(const std::filesystem::path& file, const std::wstring& query) const
+{
+    if (query.empty()) return false;
+    const std::wstring ext = lower(file.extension().wstring());
+    static const std::array<const wchar_t*, 24> textExts = {
+        L".txt", L".ini", L".cfg", L".conf", L".log", L".xml", L".json", L".csv",
+        L".cpp", L".h", L".hpp", L".c", L".cc", L".cxx", L".py", L".lua",
+        L".js", L".ts", L".css", L".html", L".htm", L".md", L".yaml", L".yml"
+    };
+    bool allowed = false;
+    for (const auto* e : textExts) if (ext == e) { allowed = true; break; }
+    if (!allowed) return false;
+
+    std::ifstream in(file, std::ios::binary);
+    if (!in) return false;
+    in.seekg(0, std::ios::end);
+    const std::streamoff size = in.tellg();
+    if (size <= 0 || size > 8 * 1024 * 1024) return false;
+    in.seekg(0, std::ios::beg);
+    std::string bytes(static_cast<size_t>(size), '\0');
+    in.read(bytes.data(), size);
+    if (!in) return false;
+
+    std::wstring text;
+    if (bytes.size() >= 2 && static_cast<unsigned char>(bytes[0]) == 0xFF && static_cast<unsigned char>(bytes[1]) == 0xFE)
+    {
+        const wchar_t* ptr = reinterpret_cast<const wchar_t*>(bytes.data() + 2);
+        const size_t chars = (bytes.size() - 2) / sizeof(wchar_t);
+        text.assign(ptr, ptr + chars);
+    }
+    else if (bytes.size() >= 2 && static_cast<unsigned char>(bytes[0]) == 0xFE && static_cast<unsigned char>(bytes[1]) == 0xFF)
+    {
+        const size_t chars = (bytes.size() - 2) / 2;
+        text.resize(chars);
+        for (size_t i = 0; i < chars; ++i)
+            text[i] = static_cast<wchar_t>((static_cast<unsigned char>(bytes[2 + i * 2]) << 8) | static_cast<unsigned char>(bytes[3 + i * 2]));
+    }
+    else if (bytes.size() >= 3 && static_cast<unsigned char>(bytes[0]) == 0xEF && static_cast<unsigned char>(bytes[1]) == 0xBB && static_cast<unsigned char>(bytes[2]) == 0xBF)
+    {
+        text = wideFromUtf8(bytes.substr(3));
+    }
+    else
+    {
+        text = wideFromUtf8(bytes);
+        if (text.empty() && !bytes.empty())
+        {
+            const int n = MultiByteToWideChar(CP_ACP, 0, bytes.data(), static_cast<int>(bytes.size()), nullptr, 0);
+            if (n > 0)
+            {
+                text.resize(static_cast<size_t>(n));
+                MultiByteToWideChar(CP_ACP, 0, bytes.data(), static_cast<int>(bytes.size()), text.data(), n);
+            }
+        }
+    }
+    if (text.empty()) return false;
+    return lower(text).find(lower(query)) != std::wstring::npos;
 }
 
 void QuickOpen::updateSearch()
@@ -982,8 +1062,9 @@ void QuickOpen::showSearchResults(const std::wstring& query)
 
     std::sort(found.begin(), found.end(), [&](const SearchResult& a, const SearchResult& b)
     {
-        const int as = std::max(fuzzyScore(query, a.path.filename().wstring()), fuzzyScore(query, a.relative));
-        const int bs = std::max(fuzzyScore(query, b.path.filename().wstring()), fuzzyScore(query, b.relative));
+        if (!query.empty() && query.front() == L'>') return lower(a.relative) < lower(b.relative);
+        const int as = (std::max)(fuzzyScore(query, a.path.filename().wstring()), fuzzyScore(query, a.relative));
+        const int bs = (std::max)(fuzzyScore(query, b.path.filename().wstring()), fuzzyScore(query, b.relative));
         if (as != bs) return as > bs;
         return lower(a.relative) < lower(b.relative);
     });
@@ -1258,6 +1339,12 @@ LRESULT QuickOpen::handleMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
 {
     switch (msg)
     {
+    case WM_GETMINMAXINFO:
+    {
+        auto* info = reinterpret_cast<MINMAXINFO*>(l);
+        if (info) { info->ptMinTrackSize.x = 250; info->ptMinTrackSize.y = 220; }
+        return 0;
+    }
     case WM_SIZE:
         layoutControls(LOWORD(l), HIWORD(l));
         return 0;
@@ -1355,6 +1442,51 @@ LRESULT QuickOpen::handleEditMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
     }
     return _oldSearchProc ? CallWindowProcW(_oldSearchProc, h, msg, w, l)
                            : DefWindowProcW(h, msg, w, l);
+}
+
+void QuickOpen::addDroppedFolders(HDROP drop)
+{
+    if (!drop) return;
+    const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+    bool changed = false;
+    for (UINT i = 0; i < count; ++i)
+    {
+        const UINT len = DragQueryFileW(drop, i, nullptr, 0);
+        std::wstring value(len + 1, L'\0');
+        DragQueryFileW(drop, i, value.data(), len + 1);
+        value.resize(wcslen(value.c_str()));
+        std::filesystem::path path(value);
+        std::error_code ec;
+        if (!std::filesystem::is_directory(path, ec)) continue;
+        if (std::find(_savedRoots.begin(), _savedRoots.end(), path) == _savedRoots.end())
+        {
+            _savedRoots.push_back(path);
+            changed = true;
+        }
+    }
+    DragFinish(drop);
+    if (changed)
+    {
+        saveWorkspace();
+        rebuildWorkspaceTree();
+        disableNativeFolderWorkspace();
+    }
+}
+
+LRESULT CALLBACK QuickOpen::nppProc(HWND h, UINT msg, WPARAM w, LPARAM l)
+{
+    if (!g_instance) return DefWindowProcW(h, msg, w, l);
+    return g_instance->handleNppMessage(h, msg, w, l);
+}
+
+LRESULT QuickOpen::handleNppMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
+{
+    if (msg == WM_DROPFILES)
+    {
+        addDroppedFolders(reinterpret_cast<HDROP>(w));
+        return 0;
+    }
+    return _oldNppProc ? CallWindowProcW(_oldNppProc, h, msg, w, l) : DefWindowProcW(h, msg, w, l);
 }
 
 LRESULT CALLBACK QuickOpen::searchPopupProc(HWND h, UINT msg, WPARAM w, LPARAM l)
