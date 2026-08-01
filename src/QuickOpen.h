@@ -126,6 +126,9 @@ private:
     void openTreeSelection();
     void handleTreeDoubleClick(LPNMTREEVIEWW tv);
     void handleTreeItemExpanding(LPNMTREEVIEWW tv);
+    void showTreeContextMenu(HTREEITEM item, POINT screenPoint);
+    void expandAllFolders();
+    void collapseAllFolders();
 
     void updateSearch();
     void showSearchResults(const std::wstring& query);
@@ -175,6 +178,8 @@ private:
     HWND _saveWorkspace{};
     HWND _removeFolder{};
     HWND _settings{};
+    HWND _expandAll{};
+    HWND _collapseAll{};
     HWND _status{};
     HWND _settingsWindow{};
     HWND _searchGroup{};
@@ -186,6 +191,7 @@ private:
 
     HFONT _font{};
     HFONT _titleFont{};
+    HFONT _symbolFont{};
     WNDPROC _oldSearchProc{};
     WNDPROC _oldPopupSearchProc{};
 

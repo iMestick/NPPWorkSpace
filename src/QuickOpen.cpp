@@ -33,6 +33,8 @@ constexpr int ID_NEW = 1005;
 constexpr int ID_SAVE = 1006;
 constexpr int ID_REMOVE = 1007;
 constexpr int ID_SETTINGS = 1008;
+constexpr int ID_EXPAND_ALL = 1012;
+constexpr int ID_COLLAPSE_ALL = 1013;
 constexpr int ID_STATUS = 1009;
 constexpr int ID_SEARCH_GROUP = 1010;
 constexpr int ID_WORKSPACE_GROUP = 1011;
@@ -193,8 +195,10 @@ void QuickOpen::destroy()
 
     if (_font) DeleteObject(_font);
     if (_titleFont) DeleteObject(_titleFont);
+    if (_symbolFont) DeleteObject(_symbolFont);
     _font = nullptr;
     _titleFont = nullptr;
+    _symbolFont = nullptr;
     g_instance = nullptr;
 }
 
@@ -223,6 +227,9 @@ void QuickOpen::createWindow()
     _titleFont = CreateFontW(-13, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                              CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+    _symbolFont = CreateFontW(-16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                              CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe MDL2 Assets");
 
     // This is a CHILD window intentionally. Notepad++'s docking manager takes
     // ownership of its placement and visibility after registration.
@@ -293,25 +300,33 @@ void QuickOpen::createControls()
         8, 66, 420, 52, _window, reinterpret_cast<HMENU>(ID_WORKSPACE_GROUP),
         GetModuleHandleW(nullptr), nullptr);
 
-    _addFolder = CreateWindowExW(0, L"BUTTON", L"+",
+    _addFolder = CreateWindowExW(0, L"BUTTON", L"\xE710",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER,
         18, 86, 32, 28, _window, reinterpret_cast<HMENU>(ID_ADD),
         GetModuleHandleW(nullptr), nullptr);
-    _newWorkspace = CreateWindowExW(0, L"BUTTON", L"□",
+    _newWorkspace = CreateWindowExW(0, L"BUTTON", L"\xE8A7",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER,
         54, 86, 32, 28, _window, reinterpret_cast<HMENU>(ID_NEW),
         GetModuleHandleW(nullptr), nullptr);
-    _saveWorkspace = CreateWindowExW(0, L"BUTTON", L"↧",
+    _saveWorkspace = CreateWindowExW(0, L"BUTTON", L"\xE74E",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER,
         90, 86, 32, 28, _window, reinterpret_cast<HMENU>(ID_SAVE),
         GetModuleHandleW(nullptr), nullptr);
-    _removeFolder = CreateWindowExW(0, L"BUTTON", L"−",
+    _removeFolder = CreateWindowExW(0, L"BUTTON", L"\xE74D",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER,
         126, 86, 32, 28, _window, reinterpret_cast<HMENU>(ID_REMOVE),
         GetModuleHandleW(nullptr), nullptr);
-    _settings = CreateWindowExW(0, L"BUTTON", L"⚙",
+    _settings = CreateWindowExW(0, L"BUTTON", L"\xE713",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER,
         162, 86, 32, 28, _window, reinterpret_cast<HMENU>(ID_SETTINGS),
+        GetModuleHandleW(nullptr), nullptr);
+    _expandAll = CreateWindowExW(0, L"BUTTON", L"\xE8A0",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER,
+        198, 86, 32, 28, _window, reinterpret_cast<HMENU>(ID_EXPAND_ALL),
+        GetModuleHandleW(nullptr), nullptr);
+    _collapseAll = CreateWindowExW(0, L"BUTTON", L"\xE8A1",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER,
+        234, 86, 32, 28, _window, reinterpret_cast<HMENU>(ID_COLLAPSE_ALL),
         GetModuleHandleW(nullptr), nullptr);
 
     _tree = CreateWindowExW(WS_EX_CLIENTEDGE, WC_TREEVIEWW, L"",
@@ -332,8 +347,12 @@ void QuickOpen::createControls()
 
     for (HWND h : {_searchGroup, _workspaceGroup, _search, _tree, _results,
                    _addFolder, _newWorkspace, _saveWorkspace, _removeFolder,
-                   _settings, _status})
+                   _settings, _expandAll, _collapseAll, _status})
         SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(_font), TRUE);
+
+    for (HWND h : {_addFolder, _newWorkspace, _saveWorkspace, _removeFolder,
+                   _settings, _expandAll, _collapseAll})
+        SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(_symbolFont), TRUE);
 
     SendMessageW(_search, EM_SETCUEBANNER, TRUE,
                  reinterpret_cast<LPARAM>(L"Pesquisar arquivos...  (use >texto para pesquisar dentro dos arquivos)"));
@@ -372,6 +391,8 @@ void QuickOpen::createTooltips()
     addButtonTooltip(_saveWorkspace, L"Salvar o NPPWorkSpace atual");
     addButtonTooltip(_removeFolder, L"Remover a pasta selecionada");
     addButtonTooltip(_settings, L"Configurar o NPPWorkSpace");
+    addButtonTooltip(_expandAll, L"Expandir todas as pastas");
+    addButtonTooltip(_collapseAll, L"Retrair todas as pastas");
 }
 
 void QuickOpen::addButtonTooltip(HWND button, const wchar_t* text)
@@ -439,10 +460,12 @@ void QuickOpen::syncNativeFolderWorkspace()
 void QuickOpen::layoutControls(int width, int height)
 {
     if (!_window) return;
-    const int minWidth = 250;
-    const int minHeight = 220;
-    width = (std::max)(minWidth, width);
-    height = (std::max)(minHeight, height);
+    constexpr int minWidth = 280;
+    constexpr int maxWidth = 620;
+    constexpr int minHeight = 260;
+    constexpr int maxHeight = 1000;
+    width = (std::max)(minWidth, (std::min)(maxWidth, width));
+    height = (std::max)(minHeight, (std::min)(maxHeight, height));
 
     const int pad = 8;
     const int searchGroupH = 58;
@@ -460,7 +483,7 @@ void QuickOpen::layoutControls(int width, int height)
     constexpr int gap = 5;
     const int buttonY = 82;
     int x = pad + 10;
-    HWND buttons[] = {_addFolder, _newWorkspace, _saveWorkspace, _removeFolder, _settings};
+    HWND buttons[] = {_addFolder, _newWorkspace, _saveWorkspace, _removeFolder, _settings, _expandAll, _collapseAll};
     for (HWND button : buttons)
     {
         MoveWindow(button, x, buttonY, buttonSize, 30, TRUE);
@@ -824,6 +847,57 @@ void QuickOpen::openTreeSelection()
         TreeView_GetItem(_tree, &stateItem);
         TreeView_Expand(_tree, item, (stateItem.state & TVIS_EXPANDED) ? TVE_COLLAPSE : TVE_EXPAND);
     }
+}
+
+void QuickOpen::showTreeContextMenu(HTREEITEM item, POINT screenPoint)
+{
+    auto it = _nodeData.find(item);
+    if (it == _nodeData.end() || it->second.type != NodeType::Root || it->second.fromNppWorkspace)
+        return;
+
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    AppendMenuW(menu, MF_STRING, ID_REMOVE, L"Remover pasta do NPPWorkSpace");
+    SetForegroundWindow(_window);
+    TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_LEFTALIGN, screenPoint.x, screenPoint.y, 0, _window, nullptr);
+    DestroyMenu(menu);
+}
+
+void QuickOpen::expandAllFolders()
+{
+    if (!_tree) return;
+    std::function<void(HTREEITEM)> expand = [&](HTREEITEM item)
+    {
+        for (HTREEITEM current = item; current; current = TreeView_GetNextSibling(_tree, current))
+        {
+            auto it = _nodeData.find(current);
+            if (it != _nodeData.end() && it->second.type != NodeType::File)
+            {
+                expandNode(current);
+                TreeView_Expand(_tree, current, TVE_EXPAND);
+                expand(TreeView_GetChild(_tree, current));
+            }
+        }
+    };
+    expand(TreeView_GetRoot(_tree));
+}
+
+void QuickOpen::collapseAllFolders()
+{
+    if (!_tree) return;
+    std::function<void(HTREEITEM)> collapse = [&](HTREEITEM item)
+    {
+        for (HTREEITEM current = item; current; current = TreeView_GetNextSibling(_tree, current))
+        {
+            HTREEITEM child = TreeView_GetChild(_tree, current);
+            if (child)
+            {
+                collapse(child);
+                TreeView_Expand(_tree, current, TVE_COLLAPSE);
+            }
+        }
+    };
+    collapse(TreeView_GetRoot(_tree));
 }
 
 void QuickOpen::handleTreeDoubleClick(LPNMTREEVIEWW tv)
@@ -1295,7 +1369,7 @@ void QuickOpen::applyTheme()
 
     for (HWND h : {_searchGroup, _workspaceGroup, _search, _tree, _results,
                    _addFolder, _newWorkspace, _saveWorkspace, _removeFolder,
-                   _settings, _status})
+                   _settings, _expandAll, _collapseAll, _status})
     {
         if (h) SendMessageW(_npp, NPPM_DARKMODESUBCLASSANDTHEME,
                             static_cast<WPARAM>(NppDarkMode::dmfHandleChange), reinterpret_cast<LPARAM>(h));
@@ -1342,12 +1416,34 @@ LRESULT QuickOpen::handleMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
     case WM_GETMINMAXINFO:
     {
         auto* info = reinterpret_cast<MINMAXINFO*>(l);
-        if (info) { info->ptMinTrackSize.x = 250; info->ptMinTrackSize.y = 220; }
+        if (info)
+        {
+            info->ptMinTrackSize.x = 280;
+            info->ptMinTrackSize.y = 260;
+            info->ptMaxTrackSize.x = 620;
+            info->ptMaxTrackSize.y = 1000;
+        }
         return 0;
     }
     case WM_SIZE:
-        layoutControls(LOWORD(l), HIWORD(l));
+    {
+        constexpr int minWidth = 280;
+        constexpr int maxWidth = 620;
+        constexpr int minHeight = 260;
+        constexpr int maxHeight = 1000;
+        const int requestedWidth = static_cast<int>(LOWORD(l));
+        const int requestedHeight = static_cast<int>(HIWORD(l));
+        const int clampedWidth = (std::max)(minWidth, (std::min)(maxWidth, requestedWidth));
+        const int clampedHeight = (std::max)(minHeight, (std::min)(maxHeight, requestedHeight));
+        if (requestedWidth != clampedWidth || requestedHeight != clampedHeight)
+        {
+            SetWindowPos(h, nullptr, 0, 0, clampedWidth, clampedHeight,
+                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            return 0;
+        }
+        layoutControls(clampedWidth, clampedHeight);
         return 0;
+    }
 
     case WM_TIMER:
         if (w == WORKSPACE_SYNC_TIMER)
@@ -1371,6 +1467,8 @@ LRESULT QuickOpen::handleMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
         if (id == ID_SAVE) { saveWorkspace(); return 0; }
         if (id == ID_REMOVE) { removeSelectedRoot(); return 0; }
         if (id == ID_SETTINGS) { openSettings(); return 0; }
+        if (id == ID_EXPAND_ALL) { expandAllFolders(); return 0; }
+        if (id == ID_COLLAPSE_ALL) { collapseAllFolders(); return 0; }
         break;
     }
 
@@ -1384,6 +1482,22 @@ LRESULT QuickOpen::handleMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
             const auto* tv = reinterpret_cast<const NMTREEVIEWW*>(l);
             if (hdr->code == NM_DBLCLK) { handleTreeDoubleClick(const_cast<NMTREEVIEWW*>(tv)); return 0; }
             if (hdr->code == TVN_ITEMEXPANDINGW) { handleTreeItemExpanding(const_cast<NMTREEVIEWW*>(tv)); return 0; }
+            if (hdr->code == NM_RCLICK)
+            {
+                POINT pt{};
+                GetCursorPos(&pt);
+                POINT client = pt;
+                ScreenToClient(_tree, &client);
+                TVHITTESTINFO hit{};
+                hit.pt = client;
+                HTREEITEM item = TreeView_HitTest(_tree, &hit);
+                if (item && (hit.flags & TVHT_ONITEM))
+                {
+                    TreeView_SelectItem(_tree, item);
+                    showTreeContextMenu(item, pt);
+                }
+                return 0;
+            }
         }
         else if (hdr->idFrom == ID_RESULTS && hdr->code == NM_DBLCLK)
         {
