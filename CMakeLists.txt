@@ -30,6 +30,7 @@ target_link_libraries(NPPWorkSpace PRIVATE
     gdi32
     shell32
     comctl32
+    comdlg32
 )
 
 set_target_properties(NPPWorkSpace PROPERTIES

@@ -3,15 +3,16 @@
 
 #include <algorithm>
 #include <cwctype>
-#include <codecvt>
-#include <locale>
 #include <fstream>
 #include <functional>
 #include <array>
 #include <iterator>
 #include <system_error>
 #include <shellapi.h>
+#include <commdlg.h>
 #include <shlobj.h>
+#include <regex>
+#include <sstream>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shell32.lib")
@@ -19,7 +20,6 @@
 namespace
 {
 constexpr wchar_t WINDOW_CLASS[] = L"NPPWorkSpacePanel";
-constexpr wchar_t SETTINGS_CLASS[] = L"NPPWorkSpaceSettings";
 constexpr wchar_t SEARCH_POPUP_CLASS[] = L"NPPWorkSpaceSearchPopup";
 constexpr wchar_t PANEL_NAME[] = L"NPPWorkSpace";
 constexpr wchar_t MODULE_NAME[] = L"NPPWorkSpace.dll";
@@ -31,8 +31,8 @@ constexpr int ID_RESULTS = 1003;
 constexpr int ID_ADD = 1004;
 constexpr int ID_NEW = 1005;
 constexpr int ID_SAVE = 1006;
+constexpr int ID_OPEN = 1014;
 constexpr int ID_REMOVE = 1007;
-constexpr int ID_SETTINGS = 1008;
 constexpr int ID_EXPAND_ALL = 1012;
 constexpr int ID_COLLAPSE_ALL = 1013;
 constexpr int ID_STATUS = 1009;
@@ -41,10 +41,6 @@ constexpr int ID_WORKSPACE_GROUP = 1011;
 constexpr int ID_POPUP_SEARCH = 1200;
 constexpr int ID_POPUP_RESULTS = 1201;
 constexpr UINT_PTR WORKSPACE_SYNC_TIMER = 4101;
-
-constexpr int ID_SETTINGS_MODE = 1100;
-constexpr int ID_SETTINGS_CLOSE = 1101;
-constexpr int ID_SETTINGS_SAVE = 1102;
 
 constexpr int ID_NODE_DUMMY = 2000;
 constexpr int MAX_SEARCH_RESULTS = 250;
@@ -81,6 +77,120 @@ std::wstring wideFromUtf8(const std::string& value)
     MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
                         static_cast<int>(value.size()), result.data(), size);
     return result;
+}
+
+std::wstring jsonEscape(const std::wstring& value)
+{
+    std::wstring out;
+    out.reserve(value.size() + 16);
+    for (wchar_t ch : value)
+    {
+        switch (ch)
+        {
+        case L'\\': out += L"\\\\"; break;
+        case L'"': out += L"\\\""; break;
+        case L'\r': out += L"\\r"; break;
+        case L'\n': out += L"\\n"; break;
+        case L'\t': out += L"\\t"; break;
+        default: out += ch; break;
+        }
+    }
+    return out;
+}
+
+std::wstring jsonUnescape(const std::wstring& value)
+{
+    std::wstring out;
+    out.reserve(value.size());
+    bool escaped = false;
+    for (wchar_t ch : value)
+    {
+        if (!escaped)
+        {
+            if (ch == L'\\') escaped = true;
+            else out += ch;
+            continue;
+        }
+        switch (ch)
+        {
+        case L'\\': out += L'\\'; break;
+        case L'"': out += L'"'; break;
+        case L'r': out += L'\r'; break;
+        case L'n': out += L'\n'; break;
+        case L't': out += L'\t'; break;
+        default: out += ch; break;
+        }
+        escaped = false;
+    }
+    if (escaped) out += L'\\';
+    return out;
+}
+
+bool extractJsonString(const std::wstring& json, const std::wstring& key, std::wstring& value)
+{
+    const std::wstring needle = L"\"" + key + L"\"";
+    const size_t keyPos = json.find(needle);
+    if (keyPos == std::wstring::npos) return false;
+    size_t pos = json.find(L':', keyPos + needle.size());
+    if (pos == std::wstring::npos) return false;
+    ++pos;
+    while (pos < json.size() && iswspace(json[pos])) ++pos;
+    if (pos >= json.size() || json[pos] != L'"') return false;
+    ++pos;
+    std::wstring raw;
+    bool escaped = false;
+    while (pos < json.size())
+    {
+        const wchar_t ch = json[pos++];
+        if (!escaped && ch == L'"')
+        {
+            value = jsonUnescape(raw);
+            return true;
+        }
+        if (!escaped && ch == L'\\')
+        {
+            raw += ch;
+            escaped = true;
+        }
+        else
+        {
+            raw += ch;
+            escaped = false;
+        }
+    }
+    return false;
+}
+
+bool extractJsonStringArray(const std::wstring& json, const std::wstring& key, std::vector<std::wstring>& values)
+{
+    const std::wstring needle = L"\"" + key + L"\"";
+    const size_t keyPos = json.find(needle);
+    if (keyPos == std::wstring::npos) return false;
+    const size_t open = json.find(L'[', keyPos + needle.size());
+    if (open == std::wstring::npos) return false;
+    const size_t close = json.find(L']', open + 1);
+    if (close == std::wstring::npos) return false;
+
+    size_t pos = open + 1;
+    while (pos < close)
+    {
+        while (pos < close && (iswspace(json[pos]) || json[pos] == L',')) ++pos;
+        if (pos >= close) break;
+        if (json[pos] != L'"') return false;
+        ++pos;
+        std::wstring value;
+        bool escaped = false;
+        while (pos < close)
+        {
+            const wchar_t ch = json[pos++];
+            if (!escaped && ch == L'"') break;
+            if (!escaped && ch == L'\\') { escaped = true; value += ch; continue; }
+            value += ch;
+            escaped = false;
+        }
+        values.push_back(jsonUnescape(value));
+    }
+    return true;
 }
 
 bool chooseFolder(HWND owner, std::filesystem::path& result)
@@ -146,6 +256,7 @@ void QuickOpen::initialize(HWND nppHandle)
     InitCommonControlsEx(&icc);
 
     loadSettings();
+    if (_workspaceFile.empty()) _workspaceFile = getWorkspaceFilePath();
     createWindow();
     if (_npp) {
         DragAcceptFiles(_npp, TRUE);
@@ -167,11 +278,6 @@ void QuickOpen::destroy()
         DestroyWindow(_tooltips);
         _tooltips = nullptr;
     }
-    if (_settingsWindow)
-    {
-        DestroyWindow(_settingsWindow);
-        _settingsWindow = nullptr;
-    }
     if (_searchPopup)
     {
         DestroyWindow(_searchPopup);
@@ -185,6 +291,7 @@ void QuickOpen::destroy()
         _oldNppProc = nullptr;
     }
 
+    releaseDockHost();
     unregisterDock();
 
     if (_window)
@@ -269,7 +376,98 @@ void QuickOpen::registerDock()
     data.pszModuleName = MODULE_NAME;
 
     if (SendMessageW(_npp, NPPM_DMMREGASDCKDLG, 0, reinterpret_cast<LPARAM>(&data)))
+    {
         _registeredDock = true;
+        refreshDockHost();
+    }
+}
+
+void QuickOpen::refreshDockHost()
+{
+    if (!_window) return;
+    HWND host = GetParent(_window);
+    if (!host || host == _dockHost) return;
+
+    releaseDockHost();
+    _dockHost = host;
+    _oldDockHostProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
+        _dockHost, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&QuickOpen::dockHostProc)));
+}
+
+void QuickOpen::releaseDockHost()
+{
+    if (_dockHost && _oldDockHostProc)
+    {
+        SetWindowLongPtrW(_dockHost, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(_oldDockHostProc));
+    }
+    _dockHost = nullptr;
+    _oldDockHostProc = nullptr;
+}
+
+LRESULT CALLBACK QuickOpen::dockHostProc(HWND h, UINT msg, WPARAM w, LPARAM l)
+{
+    if (!g_instance) return DefWindowProcW(h, msg, w, l);
+    return g_instance->handleDockHostMessage(h, msg, w, l);
+}
+
+namespace
+{
+constexpr LONG WORKSPACE_MIN_WIDTH = 340;
+constexpr LONG WORKSPACE_MAX_WIDTH = 620;
+constexpr LONG WORKSPACE_MIN_HEIGHT = 260;
+constexpr LONG WORKSPACE_MAX_HEIGHT = 1000;
+
+bool isFloatingDockHost(HWND h)
+{
+    if (!h) return false;
+    const LONG_PTR style = GetWindowLongPtrW(h, GWL_STYLE);
+    const HWND root = GetAncestor(h, GA_ROOT);
+    return root == h && ((style & WS_CAPTION) != 0 || (style & WS_POPUP) != 0);
+}
+
+void clampWorkspaceMinMaxInfo(HWND h, MINMAXINFO* info)
+{
+    if (!info) return;
+    const bool floating = isFloatingDockHost(h);
+    info->ptMinTrackSize.x = (std::max)(info->ptMinTrackSize.x, WORKSPACE_MIN_WIDTH);
+    info->ptMaxTrackSize.x = (std::min)(info->ptMaxTrackSize.x, WORKSPACE_MAX_WIDTH);
+    if (floating)
+    {
+        info->ptMinTrackSize.y = (std::max)(info->ptMinTrackSize.y, WORKSPACE_MIN_HEIGHT);
+        info->ptMaxTrackSize.y = (std::min)(info->ptMaxTrackSize.y, WORKSPACE_MAX_HEIGHT);
+    }
+}
+
+void clampWorkspaceWindowPos(HWND h, WINDOWPOS* pos)
+{
+    if (!pos || (pos->flags & SWP_NOSIZE)) return;
+    const bool floating = isFloatingDockHost(h);
+    const int minWidth = static_cast<int>(WORKSPACE_MIN_WIDTH);
+    const int maxWidth = static_cast<int>(WORKSPACE_MAX_WIDTH);
+    pos->cx = (std::max)(minWidth, (std::min)(maxWidth, pos->cx));
+    if (floating)
+    {
+        const int minHeight = static_cast<int>(WORKSPACE_MIN_HEIGHT);
+        const int maxHeight = static_cast<int>(WORKSPACE_MAX_HEIGHT);
+        pos->cy = (std::max)(minHeight, (std::min)(maxHeight, pos->cy));
+    }
+}
+}
+
+LRESULT QuickOpen::handleDockHostMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
+{
+    // Clamp BEFORE forwarding WM_WINDOWPOSCHANGING so the docking manager
+    // receives the corrected size instead of immediately overwriting it.
+    if (msg == WM_WINDOWPOSCHANGING)
+        clampWorkspaceWindowPos(h, reinterpret_cast<WINDOWPOS*>(l));
+
+    LRESULT result = _oldDockHostProc ? CallWindowProcW(_oldDockHostProc, h, msg, w, l)
+                                      : DefWindowProcW(h, msg, w, l);
+
+    if (msg == WM_GETMINMAXINFO)
+        clampWorkspaceMinMaxInfo(h, reinterpret_cast<MINMAXINFO*>(l));
+
+    return result;
 }
 
 void QuickOpen::unregisterDock()
@@ -287,71 +485,71 @@ void QuickOpen::createControls()
     // Notepad++ dialogs: search on top, workspace actions underneath.
     _searchGroup = CreateWindowExW(0, L"BUTTON", L"Pesquisar",
         WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-        8, 4, 420, 58, _window, reinterpret_cast<HMENU>(ID_SEARCH_GROUP),
+        8, 4, 420, 58, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_SEARCH_GROUP)),
         GetModuleHandleW(nullptr), nullptr);
 
     _search = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_NOHIDESEL,
-        18, 24, 400, 26, _window, reinterpret_cast<HMENU>(ID_SEARCH),
+        18, 24, 400, 26, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_SEARCH)),
         GetModuleHandleW(nullptr), nullptr);
 
     _workspaceGroup = CreateWindowExW(0, L"BUTTON", L"Workspace",
         WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-        8, 66, 420, 52, _window, reinterpret_cast<HMENU>(ID_WORKSPACE_GROUP),
+        8, 66, 420, 52, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_WORKSPACE_GROUP)),
         GetModuleHandleW(nullptr), nullptr);
 
     _addFolder = CreateWindowExW(0, L"BUTTON", L"\xE710",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER,
-        18, 86, 32, 28, _window, reinterpret_cast<HMENU>(ID_ADD),
+        18, 86, 32, 28, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_ADD)),
         GetModuleHandleW(nullptr), nullptr);
     _newWorkspace = CreateWindowExW(0, L"BUTTON", L"\xE8A7",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER,
-        54, 86, 32, 28, _window, reinterpret_cast<HMENU>(ID_NEW),
+        54, 86, 32, 28, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_NEW)),
         GetModuleHandleW(nullptr), nullptr);
     _saveWorkspace = CreateWindowExW(0, L"BUTTON", L"\xE74E",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER,
-        90, 86, 32, 28, _window, reinterpret_cast<HMENU>(ID_SAVE),
+        90, 86, 32, 28, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_SAVE)),
+        GetModuleHandleW(nullptr), nullptr);
+    _openWorkspace = CreateWindowExW(0, L"BUTTON", L"\xE8B7",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER,
+        126, 86, 32, 28, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_OPEN)),
         GetModuleHandleW(nullptr), nullptr);
     _removeFolder = CreateWindowExW(0, L"BUTTON", L"\xE74D",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER,
-        126, 86, 32, 28, _window, reinterpret_cast<HMENU>(ID_REMOVE),
-        GetModuleHandleW(nullptr), nullptr);
-    _settings = CreateWindowExW(0, L"BUTTON", L"\xE713",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER,
-        162, 86, 32, 28, _window, reinterpret_cast<HMENU>(ID_SETTINGS),
+        162, 86, 32, 28, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_REMOVE)),
         GetModuleHandleW(nullptr), nullptr);
     _expandAll = CreateWindowExW(0, L"BUTTON", L"\xE8A0",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER,
-        198, 86, 32, 28, _window, reinterpret_cast<HMENU>(ID_EXPAND_ALL),
+        198, 86, 32, 28, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_EXPAND_ALL)),
         GetModuleHandleW(nullptr), nullptr);
     _collapseAll = CreateWindowExW(0, L"BUTTON", L"\xE8A1",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER,
-        234, 86, 32, 28, _window, reinterpret_cast<HMENU>(ID_COLLAPSE_ALL),
+        234, 86, 32, 28, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_COLLAPSE_ALL)),
         GetModuleHandleW(nullptr), nullptr);
 
     _tree = CreateWindowExW(WS_EX_CLIENTEDGE, WC_TREEVIEWW, L"",
         WS_CHILD | WS_VISIBLE | TVS_HASBUTTONS | TVS_HASLINES | TVS_LINESATROOT |
         TVS_SHOWSELALWAYS | TVS_INFOTIP,
-        10, 126, 410, 500, _window, reinterpret_cast<HMENU>(ID_TREE),
+        10, 126, 410, 500, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_TREE)),
         GetModuleHandleW(nullptr), nullptr);
 
     _results = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
         WS_CHILD | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
-        10, 126, 410, 500, _window, reinterpret_cast<HMENU>(ID_RESULTS),
+        10, 126, 410, 500, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_RESULTS)),
         GetModuleHandleW(nullptr), nullptr);
 
     _status = CreateWindowExW(0, L"STATIC", L"Ctrl+B mostrar/ocultar  |  Ctrl+P pesquisar",
         WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
-        10, 632, 410, 22, _window, reinterpret_cast<HMENU>(ID_STATUS),
+        10, 632, 410, 22, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_STATUS)),
         GetModuleHandleW(nullptr), nullptr);
 
     for (HWND h : {_searchGroup, _workspaceGroup, _search, _tree, _results,
-                   _addFolder, _newWorkspace, _saveWorkspace, _removeFolder,
-                   _settings, _expandAll, _collapseAll, _status})
+                   _addFolder, _newWorkspace, _saveWorkspace, _openWorkspace, _removeFolder,
+                   _expandAll, _collapseAll, _status})
         SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(_font), TRUE);
 
-    for (HWND h : {_addFolder, _newWorkspace, _saveWorkspace, _removeFolder,
-                   _settings, _expandAll, _collapseAll})
+    for (HWND h : {_addFolder, _newWorkspace, _saveWorkspace, _openWorkspace, _removeFolder,
+                   _expandAll, _collapseAll})
         SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(_symbolFont), TRUE);
 
     SendMessageW(_search, EM_SETCUEBANNER, TRUE,
@@ -388,9 +586,9 @@ void QuickOpen::createTooltips()
     SendMessageW(_tooltips, TTM_SETMAXTIPWIDTH, 0, 320);
     addButtonTooltip(_addFolder, L"Adicionar pasta ao NPPWorkSpace");
     addButtonTooltip(_newWorkspace, L"Criar um novo NPPWorkSpace");
-    addButtonTooltip(_saveWorkspace, L"Salvar o NPPWorkSpace atual");
+    addButtonTooltip(_saveWorkspace, L"Salvar o NPPWorkSpace atual (.worknpp)");
+    addButtonTooltip(_openWorkspace, L"Abrir um arquivo .worknpp");
     addButtonTooltip(_removeFolder, L"Remover a pasta selecionada");
-    addButtonTooltip(_settings, L"Configurar o NPPWorkSpace");
     addButtonTooltip(_expandAll, L"Expandir todas as pastas");
     addButtonTooltip(_collapseAll, L"Retrair todas as pastas");
 }
@@ -445,7 +643,7 @@ void QuickOpen::syncNativeFolderWorkspace()
     }
     if (changed)
     {
-        saveWorkspace();
+        writeWorkspaceFile();
         _nppRoots = roots;
         rebuildWorkspaceTree();
     }
@@ -460,12 +658,12 @@ void QuickOpen::syncNativeFolderWorkspace()
 void QuickOpen::layoutControls(int width, int height)
 {
     if (!_window) return;
-    constexpr int minWidth = 280;
-    constexpr int maxWidth = 620;
-    constexpr int minHeight = 260;
-    constexpr int maxHeight = 1000;
-    width = (std::max)(minWidth, (std::min)(maxWidth, width));
-    height = (std::max)(minHeight, (std::min)(maxHeight, height));
+    width = (std::max)(static_cast<int>(WORKSPACE_MIN_WIDTH),
+                       (std::min)(static_cast<int>(WORKSPACE_MAX_WIDTH), width));
+    const bool floating = isFloatingDockHost(_dockHost);
+    if (floating)
+        height = (std::max)(static_cast<int>(WORKSPACE_MIN_HEIGHT),
+                            (std::min)(static_cast<int>(WORKSPACE_MAX_HEIGHT), height));
 
     const int pad = 8;
     const int searchGroupH = 58;
@@ -483,7 +681,7 @@ void QuickOpen::layoutControls(int width, int height)
     constexpr int gap = 5;
     const int buttonY = 82;
     int x = pad + 10;
-    HWND buttons[] = {_addFolder, _newWorkspace, _saveWorkspace, _removeFolder, _settings, _expandAll, _collapseAll};
+    HWND buttons[] = {_addFolder, _newWorkspace, _saveWorkspace, _openWorkspace, _removeFolder, _expandAll, _collapseAll};
     for (HWND button : buttons)
     {
         MoveWindow(button, x, buttonY, buttonSize, 30, TRUE);
@@ -551,7 +749,7 @@ void QuickOpen::createSearchPopup()
 
     _searchPopupEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_NOHIDESEL,
-        12, 38, 720, 30, _searchPopup, reinterpret_cast<HMENU>(ID_POPUP_SEARCH),
+        12, 38, 720, 30, _searchPopup, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_POPUP_SEARCH)),
         GetModuleHandleW(nullptr), nullptr);
     SendMessageW(_searchPopupEdit, WM_SETFONT, reinterpret_cast<WPARAM>(_font), TRUE);
     SendMessageW(_searchPopupEdit, EM_SETCUEBANNER, TRUE,
@@ -559,7 +757,7 @@ void QuickOpen::createSearchPopup()
 
     _searchPopupResults = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
         WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
-        12, 78, 720, 310, _searchPopup, reinterpret_cast<HMENU>(ID_POPUP_RESULTS),
+        12, 78, 720, 310, _searchPopup, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_POPUP_RESULTS)),
         GetModuleHandleW(nullptr), nullptr);
     SendMessageW(_searchPopupResults, WM_SETFONT, reinterpret_cast<WPARAM>(_font), TRUE);
     ListView_SetExtendedListViewStyle(_searchPopupResults, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
@@ -681,7 +879,7 @@ void QuickOpen::refreshWorkspace()
     for (const auto& root : _nppRoots)
         if (std::find(_savedRoots.begin(), _savedRoots.end(), root) == _savedRoots.end())
             _savedRoots.push_back(root);
-    saveWorkspace();
+    writeWorkspaceFile();
     rebuildWorkspaceTree();
 }
 
@@ -1193,7 +1391,7 @@ void QuickOpen::addFolder()
     if (std::find(_savedRoots.begin(), _savedRoots.end(), folder) == _savedRoots.end())
         _savedRoots.push_back(folder);
 
-    saveWorkspace();
+    writeWorkspaceFile();
     rebuildWorkspaceTree();
 }
 
@@ -1207,59 +1405,152 @@ void QuickOpen::removeSelectedRoot()
 
     const auto path = it->second.path;
     _savedRoots.erase(std::remove(_savedRoots.begin(), _savedRoots.end(), path), _savedRoots.end());
-    saveWorkspace();
+    writeWorkspaceFile();
     rebuildWorkspaceTree();
 }
 
 void QuickOpen::newWorkspace()
 {
+    const int answer = MessageBoxW(
+        _window,
+        L"Deseja salvar a configuração atual da workspace antes de criar uma nova?",
+        L"Nova Workspace",
+        MB_ICONQUESTION | MB_YESNOCANCEL | MB_DEFBUTTON1);
+
+    if (answer == IDCANCEL) return;
+    if (answer == IDYES && !saveWorkspace()) return;
+
     _savedRoots.clear();
-    saveWorkspace();
-    rebuildWorkspaceTree();
+    _workspaceFile.clear();
+    clearSearchResults();
+    rebuildWorkspaceTree(false);
+    saveSettings();
 }
 
-void QuickOpen::saveWorkspace()
+bool QuickOpen::saveWorkspace()
 {
-    const std::wstring file = getWorkspaceFilePath();
-    std::error_code ec;
-    std::filesystem::create_directories(std::filesystem::path(file).parent_path(), ec);
+    // Explicit Save always asks where the .worknpp should be written.
+    return saveWorkspaceAs();
+}
 
-    std::ofstream out(file, std::ios::binary | std::ios::trunc);
-    if (!out) return;
-    const unsigned char bom[] = {0xEF, 0xBB, 0xBF};
-    out.write(reinterpret_cast<const char*>(bom), sizeof(bom));
-    for (const auto& root : _savedRoots)
+bool QuickOpen::writeWorkspaceFile()
+{
+    if (_workspaceFile.empty()) return false;
+
+    const std::filesystem::path target(_workspaceFile);
+    std::error_code ec;
+    if (!target.parent_path().empty())
+        std::filesystem::create_directories(target.parent_path(), ec);
+
+    std::wstringstream json;
+    json << L"{\n";
+    json << L"  \"format\": \"NPPWorkSpace\",\n";
+    json << L"  \"version\": 1,\n";
+    json << L"  \"workspace\": {\n";
+    json << L"    \"folders\": [\n";
+    for (size_t i = 0; i < _savedRoots.size(); ++i)
     {
-        const std::string line = utf8FromWide(root.wstring());
-        out.write(line.data(), static_cast<std::streamsize>(line.size()));
-        out.write("\r\n", 2);
+        json << L"      \"" << jsonEscape(_savedRoots[i].wstring()) << L"\"";
+        if (i + 1 < _savedRoots.size()) json << L',';
+        json << L"\n";
     }
+    json << L"    ],\n";
+    json << L"    \"shortcuts\": {\n";
+    json << L"      \"toggleWorkspace\": \"" << jsonEscape(NPPWorkSpace_GetToggleShortcut()) << L"\",\n";
+    json << L"      \"search\": \"" << jsonEscape(NPPWorkSpace_GetSearchShortcut()) << L"\"\n";
+    json << L"    }\n";
+    json << L"  }\n";
+    json << L"}\n";
+
+    const std::string utf8 = utf8FromWide(json.str());
+    std::ofstream out(target, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    out.write(utf8.data(), static_cast<std::streamsize>(utf8.size()));
+    if (!out.good()) return false;
+
+    saveSettings();
+    return true;
+}
+
+bool QuickOpen::saveWorkspaceAs()
+{
+    wchar_t fileName[MAX_PATH * 4] = L"NPPWorkSpace.worknpp";
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = _window;
+    ofn.lpstrFilter = L"NPPWorkSpace (*.worknpp)\0*.worknpp\0Todos os arquivos (*.*)\0*.*\0\0";
+    ofn.lpstrFile = fileName;
+    ofn.nMaxFile = static_cast<DWORD>(std::size(fileName));
+    ofn.lpstrDefExt = L"worknpp";
+    ofn.Flags = OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
+    if (!GetSaveFileNameW(&ofn)) return false;
+
+    std::wstring path(fileName);
+    if (path.size() < 8 || _wcsicmp(path.c_str() + path.size() - 8, L".worknpp") != 0)
+        path += L".worknpp";
+    _workspaceFile = path;
+    return writeWorkspaceFile();
+}
+
+void QuickOpen::openWorkspaceFile()
+{
+    wchar_t fileName[MAX_PATH * 4]{};
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = _window;
+    ofn.lpstrFilter = L"NPPWorkSpace (*.worknpp)\0*.worknpp\0Todos os arquivos (*.*)\0*.*\0\0";
+    ofn.lpstrFile = fileName;
+    ofn.nMaxFile = static_cast<DWORD>(std::size(fileName));
+    ofn.lpstrDefExt = L"worknpp";
+    ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    if (!GetOpenFileNameW(&ofn)) return;
+
+    loadWorkspaceFile(fileName);
+}
+
+bool QuickOpen::loadWorkspaceFile(const std::wstring& filePath)
+{
+    std::ifstream in(std::filesystem::path(filePath), std::ios::binary);
+    if (!in) return false;
+    const std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    std::wstring json = wideFromUtf8(bytes);
+    if (json.empty()) return false;
+
+    std::vector<std::wstring> folders;
+    if (!extractJsonStringArray(json, L"folders", folders)) return false;
+
+    std::wstring toggleShortcut;
+    std::wstring searchShortcut;
+    if (extractJsonString(json, L"toggleWorkspace", toggleShortcut))
+        NPPWorkSpace_SetToggleShortcut(toggleShortcut);
+    if (extractJsonString(json, L"search", searchShortcut))
+        NPPWorkSpace_SetSearchShortcut(searchShortcut);
+
+    std::vector<std::filesystem::path> loaded;
+    for (const auto& folder : folders)
+    {
+        if (folder.empty()) continue;
+        std::filesystem::path path(folder);
+        if (std::find(loaded.begin(), loaded.end(), path) == loaded.end())
+            loaded.push_back(path);
+    }
+
+    // Only replace the current workspace after the file was parsed successfully.
+    _savedRoots = std::move(loaded);
+    _workspaceFile = filePath;
+    clearSearchResults();
+    saveSettings();
+    rebuildWorkspaceTree(false);
+    disableNativeFolderWorkspace();
+    return true;
 }
 
 void QuickOpen::loadWorkspace()
 {
     _savedRoots.clear();
-    std::ifstream in(getWorkspaceFilePath(), std::ios::binary);
-    if (!in) return;
-
-    std::string line;
-    bool first = true;
-    while (std::getline(in, line))
-    {
-        if (first && line.size() >= 3 && static_cast<unsigned char>(line[0]) == 0xEF &&
-            static_cast<unsigned char>(line[1]) == 0xBB && static_cast<unsigned char>(line[2]) == 0xBF)
-            line.erase(0, 3);
-        first = false;
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (line.empty()) continue;
-        const std::wstring wideLine = wideFromUtf8(line);
-        if (wideLine.empty()) continue;
-        std::error_code ec;
-        std::filesystem::path path(wideLine);
-        if (std::filesystem::is_directory(path, ec) &&
-            std::find(_savedRoots.begin(), _savedRoots.end(), path) == _savedRoots.end())
-            _savedRoots.push_back(path);
-    }
+    if (_workspaceFile.empty()) _workspaceFile = getWorkspaceFilePath();
+    if (std::filesystem::exists(_workspaceFile))
+        loadWorkspaceFile(_workspaceFile);
 }
 
 std::vector<std::filesystem::path> QuickOpen::getWorkspaceRootsForPanel() const
@@ -1279,8 +1570,8 @@ std::wstring QuickOpen::getWorkspaceFilePath() const
 {
     wchar_t buffer[32768]{};
     if (_npp && SendMessageW(_npp, NPPM_GETNPPSETTINGSDIRPATH, 32768, reinterpret_cast<LPARAM>(buffer)))
-        return std::wstring(buffer) + L"\\plugins\\config\\NPPWorkSpace.workspace";
-    return L"NPPWorkSpace.workspace";
+        return std::wstring(buffer) + L"\\plugins\\config\\NPPWorkSpace.worknpp";
+    return L"NPPWorkSpace.worknpp";
 }
 
 void QuickOpen::loadSettings()
@@ -1294,8 +1585,11 @@ void QuickOpen::loadSettings()
             static_cast<unsigned char>(line[1]) == 0xBB && static_cast<unsigned char>(line[2]) == 0xBF)
             line.erase(0, 3);
         first = false;
-        // Reserved for future NPPWorkSpace settings. Shortcut configuration
-        // remains integrated with Notepad++ Shortcut Mapper.
+        if (line.rfind("WorkspaceFile=", 0) == 0)
+        {
+            const std::wstring value = wideFromUtf8(line.substr(14));
+            if (!value.empty()) _workspaceFile = value;
+        }
     }
 }
 
@@ -1309,41 +1603,8 @@ void QuickOpen::saveSettings() const
     {
         const unsigned char bom[] = {0xEF, 0xBB, 0xBF};
         out.write(reinterpret_cast<const char*>(bom), sizeof(bom));
-        out << "Version=1\r\n";
-    }
-}
-
-void QuickOpen::openSettings()
-{
-    if (_settingsWindow)
-    {
-        ShowWindow(_settingsWindow, SW_SHOW);
-        SetForegroundWindow(_settingsWindow);
-        return;
-    }
-
-    WNDCLASSEXW wc{sizeof(wc)};
-    wc.lpfnWndProc = &QuickOpen::settingsProc;
-    wc.hInstance = GetModuleHandleW(nullptr);
-    wc.lpszClassName = SETTINGS_CLASS;
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
-    RegisterClassExW(&wc);
-
-    _settingsWindow = CreateWindowExW(
-        WS_EX_DLGMODALFRAME,
-        SETTINGS_CLASS,
-        L"NPPWorkSpace — Configurações",
-        WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT, 620, 300,
-        _npp, nullptr, GetModuleHandleW(nullptr), this);
-
-    if (_settingsWindow)
-    {
-        SendMessageW(_settingsWindow, WM_SETFONT, reinterpret_cast<WPARAM>(_font), TRUE);
-        RECT r{};
-        GetWindowRect(_npp, &r);
-        SetWindowPos(_settingsWindow, nullptr, r.left + 80, r.top + 80, 620, 300, SWP_NOZORDER);
+        out << "Version=2\r\n";
+        out << "WorkspaceFile=" << utf8FromWide(_workspaceFile) << "\r\n";
     }
 }
 
@@ -1368,8 +1629,8 @@ void QuickOpen::applyTheme()
     ListView_SetTextColor(_results, colors.text);
 
     for (HWND h : {_searchGroup, _workspaceGroup, _search, _tree, _results,
-                   _addFolder, _newWorkspace, _saveWorkspace, _removeFolder,
-                   _settings, _expandAll, _collapseAll, _status})
+                   _addFolder, _newWorkspace, _saveWorkspace, _openWorkspace, _removeFolder,
+                   _expandAll, _collapseAll, _status})
     {
         if (h) SendMessageW(_npp, NPPM_DARKMODESUBCLASSANDTHEME,
                             static_cast<WPARAM>(NppDarkMode::dmfHandleChange), reinterpret_cast<LPARAM>(h));
@@ -1416,38 +1677,30 @@ LRESULT QuickOpen::handleMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
     case WM_GETMINMAXINFO:
     {
         auto* info = reinterpret_cast<MINMAXINFO*>(l);
-        if (info)
-        {
-            info->ptMinTrackSize.x = 280;
-            info->ptMinTrackSize.y = 260;
-            info->ptMaxTrackSize.x = 620;
-            info->ptMaxTrackSize.y = 1000;
-        }
+        // The panel itself is a child of Notepad++'s docking host. Applying
+        // limits here keeps layout responsive while the host limits the real
+        // resize operation. Docked mode constrains width only; floating mode
+        // constrains both dimensions.
+        clampWorkspaceMinMaxInfo(h, info);
         return 0;
+    }
+    case WM_WINDOWPOSCHANGING:
+    {
+        clampWorkspaceWindowPos(h, reinterpret_cast<WINDOWPOS*>(l));
+        break;
     }
     case WM_SIZE:
     {
-        constexpr int minWidth = 280;
-        constexpr int maxWidth = 620;
-        constexpr int minHeight = 260;
-        constexpr int maxHeight = 1000;
         const int requestedWidth = static_cast<int>(LOWORD(l));
         const int requestedHeight = static_cast<int>(HIWORD(l));
-        const int clampedWidth = (std::max)(minWidth, (std::min)(maxWidth, requestedWidth));
-        const int clampedHeight = (std::max)(minHeight, (std::min)(maxHeight, requestedHeight));
-        if (requestedWidth != clampedWidth || requestedHeight != clampedHeight)
-        {
-            SetWindowPos(h, nullptr, 0, 0, clampedWidth, clampedHeight,
-                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-            return 0;
-        }
-        layoutControls(clampedWidth, clampedHeight);
+        layoutControls(requestedWidth, requestedHeight);
         return 0;
     }
 
     case WM_TIMER:
         if (w == WORKSPACE_SYNC_TIMER)
         {
+            refreshDockHost();
             syncNativeFolderWorkspace();
             return 0;
         }
@@ -1465,8 +1718,8 @@ LRESULT QuickOpen::handleMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
         if (id == ID_ADD) { addFolder(); return 0; }
         if (id == ID_NEW) { newWorkspace(); return 0; }
         if (id == ID_SAVE) { saveWorkspace(); return 0; }
+        if (id == ID_OPEN) { openWorkspaceFile(); return 0; }
         if (id == ID_REMOVE) { removeSelectedRoot(); return 0; }
-        if (id == ID_SETTINGS) { openSettings(); return 0; }
         if (id == ID_EXPAND_ALL) { expandAllFolders(); return 0; }
         if (id == ID_COLLAPSE_ALL) { collapseAllFolders(); return 0; }
         break;
@@ -1581,7 +1834,7 @@ void QuickOpen::addDroppedFolders(HDROP drop)
     DragFinish(drop);
     if (changed)
     {
-        saveWorkspace();
+        writeWorkspaceFile();
         rebuildWorkspaceTree();
         disableNativeFolderWorkspace();
     }
@@ -1597,7 +1850,7 @@ LRESULT QuickOpen::handleNppMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
 {
     if (msg == WM_DROPFILES)
     {
-        addDroppedFolders(reinterpret_cast<HDROP>(w));
+        addDroppedFolders(reinterpret_cast<HDROP>(static_cast<UINT_PTR>(w)));
         return 0;
     }
     return _oldNppProc ? CallWindowProcW(_oldNppProc, h, msg, w, l) : DefWindowProcW(h, msg, w, l);
@@ -1667,50 +1920,5 @@ LRESULT QuickOpen::handleSearchPopupMessage(HWND h, UINT msg, WPARAM w, LPARAM l
         _searchPopupResults = nullptr;
         return 0;
     }
-    return DefWindowProcW(h, msg, w, l);
-}
-
-LRESULT CALLBACK QuickOpen::settingsProc(HWND h, UINT msg, WPARAM w, LPARAM l)
-{
-    if (msg == WM_NCCREATE)
-    {
-        const auto* cs = reinterpret_cast<const CREATESTRUCTW*>(l);
-        SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
-    }
-    auto* self = reinterpret_cast<QuickOpen*>(GetWindowLongPtrW(h, GWLP_USERDATA));
-    return self ? self->handleSettingsMessage(h, msg, w, l) : DefWindowProcW(h, msg, w, l);
-}
-
-LRESULT QuickOpen::handleSettingsMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
-{
-    switch (msg)
-    {
-    case WM_CREATE:
-        CreateWindowW(L"STATIC", L"Atalhos padrão do NPPWorkSpace:", WS_CHILD | WS_VISIBLE,
-                      20, 20, 300, 24, h, nullptr, GetModuleHandleW(nullptr), nullptr);
-        CreateWindowW(L"STATIC", L"Ctrl+B  —  Mostrar/ocultar o painel NPPWorkSpace\nCtrl+P  —  Abrir a pesquisa do NPPWorkSpace\n\nOs atalhos podem ser alterados em Plugins → NPPWorkSpace → Shortcut Mapper.",
-                      WS_CHILD | WS_VISIBLE, 20, 50, 550, 90, h, nullptr, GetModuleHandleW(nullptr), nullptr);
-        CreateWindowW(L"STATIC", L"As pastas adicionadas pelo NPPWorkSpace são salvas automaticamente no workspace do plugin.",
-                      WS_CHILD | WS_VISIBLE, 20, 155, 550, 40, h, nullptr, GetModuleHandleW(nullptr), nullptr);
-        CreateWindowW(L"BUTTON", L"Salvar configurações", WS_CHILD | WS_VISIBLE,
-                      360, 215, 120, 28, h, reinterpret_cast<HMENU>(ID_SETTINGS_SAVE), GetModuleHandleW(nullptr), nullptr);
-        CreateWindowW(L"BUTTON", L"Fechar", WS_CHILD | WS_VISIBLE,
-                      490, 215, 80, 28, h, reinterpret_cast<HMENU>(ID_SETTINGS_CLOSE), GetModuleHandleW(nullptr), nullptr);
-        return 0;
-
-    case WM_COMMAND:
-        if (LOWORD(w) == ID_SETTINGS_SAVE) { saveSettings(); return 0; }
-        if (LOWORD(w) == ID_SETTINGS_CLOSE) { DestroyWindow(h); return 0; }
-        break;
-
-    case WM_CLOSE:
-        DestroyWindow(h);
-        return 0;
-
-    case WM_DESTROY:
-        _settingsWindow = nullptr;
-        return 0;
-    }
-
     return DefWindowProcW(h, msg, w, l);
 }

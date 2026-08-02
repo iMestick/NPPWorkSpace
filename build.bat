@@ -31,4 +31,4 @@ echo ========================================
 echo BUILD CONCLUIDO COM SUCESSO!
 echo ========================================
 
-pause
+exit /b 0

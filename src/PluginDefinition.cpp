@@ -1,17 +1,49 @@
-﻿#include "PluginInterface.h"
+#include "PluginInterface.h"
 #include "QuickOpen.h"
 #include <windows.h>
 
-namespace
-{
 NppData g_nppData{};
-FuncItem g_funcItems[4]{};
+FuncItem g_funcItems[3]{};
 
 // Default shortcuts requested for NPPWorkSpace.
 ShortcutKey g_workspaceShortcut{true, false, false, 'B'};
 ShortcutKey g_searchShortcut{true, false, false, 'P'};
-ShortcutKey g_settingsShortcut{false, false, false, 0};
 ShortcutKey g_refreshShortcut{false, false, false, 0};
+
+std::wstring shortcutToString(const ShortcutKey& key)
+{
+    std::wstring result;
+    if (key._isCtrl) result += L"Ctrl+";
+    if (key._isAlt) result += L"Alt+";
+    if (key._isShift) result += L"Shift+";
+    if (key._key) result += static_cast<wchar_t>(key._key);
+    return result;
+}
+
+bool setShortcutFromString(ShortcutKey& key, const std::wstring& value)
+{
+    if (value.empty()) return false;
+    ShortcutKey parsed{};
+    size_t start = 0;
+    while (start < value.size())
+    {
+        const size_t plus = value.find(L'+', start);
+        const std::wstring token = value.substr(start, plus == std::wstring::npos ? std::wstring::npos : plus - start);
+        if (_wcsicmp(token.c_str(), L"Ctrl") == 0) parsed._isCtrl = true;
+        else if (_wcsicmp(token.c_str(), L"Alt") == 0) parsed._isAlt = true;
+        else if (_wcsicmp(token.c_str(), L"Shift") == 0) parsed._isShift = true;
+        else if (token.size() == 1) parsed._key = static_cast<char>(token[0]);
+        else return false;
+        if (plus == std::wstring::npos) break;
+        start = plus + 1;
+    }
+    if (!parsed._key) return false;
+    key = parsed;
+    return true;
+}
+
+namespace
+{
 
 void commandWorkspace()
 {
@@ -23,11 +55,6 @@ void commandSearch()
     QuickOpen::instance().focusSearch();
 }
 
-void commandSettings()
-{
-    QuickOpen::instance().openSettings();
-}
-
 void commandRefresh()
 {
     QuickOpen::instance().refreshWorkspace();
@@ -37,6 +64,26 @@ void setText(int index, const wchar_t* text)
 {
     wcsncpy_s(g_funcItems[index]._itemName, text, _TRUNCATE);
 }
+}
+
+std::wstring NPPWorkSpace_GetToggleShortcut()
+{
+    return shortcutToString(g_workspaceShortcut);
+}
+
+std::wstring NPPWorkSpace_GetSearchShortcut()
+{
+    return shortcutToString(g_searchShortcut);
+}
+
+void NPPWorkSpace_SetToggleShortcut(const std::wstring& value)
+{
+    setShortcutFromString(g_workspaceShortcut, value);
+}
+
+void NPPWorkSpace_SetSearchShortcut(const std::wstring& value)
+{
+    setShortcutFromString(g_searchShortcut, value);
 }
 
 extern "C" __declspec(dllexport) void setInfo(NppData data)
@@ -52,13 +99,9 @@ extern "C" __declspec(dllexport) void setInfo(NppData data)
     g_funcItems[1]._pFunc = commandSearch;
     g_funcItems[1]._pShKey = &g_searchShortcut;
 
-    setText(2, L"NPPWorkSpace — Configurações...");
-    g_funcItems[2]._pFunc = commandSettings;
-    g_funcItems[2]._pShKey = &g_settingsShortcut;
-
-    setText(3, L"NPPWorkSpace — Atualizar workspace");
-    g_funcItems[3]._pFunc = commandRefresh;
-    g_funcItems[3]._pShKey = &g_refreshShortcut;
+    setText(2, L"NPPWorkSpace — Atualizar workspace");
+    g_funcItems[2]._pFunc = commandRefresh;
+    g_funcItems[2]._pShKey = &g_refreshShortcut;
 }
 
 extern "C" __declspec(dllexport) const wchar_t* getName()
@@ -68,7 +111,7 @@ extern "C" __declspec(dllexport) const wchar_t* getName()
 
 extern "C" __declspec(dllexport) FuncItem* getFuncsArray(int* n)
 {
-    if (n) *n = 4;
+    if (n) *n = 3;
     // The first plugin command is used as the docking manager's dlgID.
     QuickOpen::instance().setDockCommandId(0);
     QuickOpen::instance().registerDockPanel();

@@ -1,40 +1,61 @@
 # NPPWorkSpace
 
-Plugin para Notepad++ que fornece um workspace próprio com árvore de pastas, subpastas, arquivos e pesquisa rápida.
+Plugin nativo para Notepad++ que fornece um workspace próprio, integrado ao sistema de docking do Notepad++.
 
-## Atalhos
+## Recursos
 
-- **Ctrl+B**: mostrar/ocultar o painel NPPWorkSpace.
-- **Ctrl+P**: abrir o pesquisador flutuante.
-- Os dois comandos aparecem no **Plugins > NPPWorkSpace** e podem ser alterados no **Shortcut Mapper** do próprio Notepad++.
+- Painel dockável integrado ao Notepad++.
+- Largura limitada entre **340 e 620 px** no modo acoplado e flutuante.
+- Altura limitada entre **260 e 1000 px** tanto no modo acoplado quanto no modo flutuante.
+- Árvore de pastas e subpastas.
+- Expandir/retrair todas as pastas.
+- Remover uma pasta raiz pelo botão ou menu de contexto.
+- Arrastar pastas para o Notepad++ adiciona a pasta ao NPPWorkSpace e o Folder as Workspace nativo é ocultado.
+- Pesquisa de arquivos e pesquisa de conteúdo usando `>texto`.
+- `Ctrl+B` para mostrar/ocultar o workspace.
+- `Ctrl+P` para abrir o pesquisador flutuante.
+- Atalhos continuam disponíveis no **Plugins → NPPWorkSpace → Shortcut Mapper**.
+- Salvar e abrir workspaces pelo formato **`.worknpp`**.
+- O `.worknpp` é texto UTF-8 estruturado em JSON, contendo pastas e atalhos.
+- Ao abrir um `.worknpp`, o workspace atual é substituído pela configuração carregada.
 
-## Interface
+## Formato `.worknpp`
 
-- O workspace é um painel dockável integrado ao Notepad++.
-- A pesquisa permanente fica em uma caixa separada no topo.
-- Os comandos de workspace ficam em uma caixa separada abaixo da pesquisa.
-- O Ctrl+P abre uma janela de pesquisa pertencente ao Notepad++, sem comportamento de janela independente.
-- A janela de pesquisa não fecha ao clicar fora; `Esc` ou o botão X fecha.
-- A árvore suporta pastas e subpastas expansíveis.
+```json
+{
+  "format": "NPPWorkSpace",
+  "version": 1,
+  "workspace": {
+    "folders": [
+      "C:\\Projeto",
+      "D:\\OutroProjeto"
+    ],
+    "shortcuts": {
+      "toggleWorkspace": "Ctrl+B",
+      "search": "Ctrl+P"
+    }
+  }
+}
+```
 
-## Encoding
+## Estrutura do projeto
 
-O projeto é compilado explicitamente em UTF-8 no MSVC (`/utf-8`) e os arquivos de workspace/configuração são gravados em UTF-8 com BOM, preservando nomes de pastas e arquivos com acentos.
+```text
+NPPWorkSpace/
+├── CMakeLists.txt
+├── README.md
+├── build.bat
+└── src/
+    ├── dllmain.cpp
+    ├── NotepadPlusMsgs.h
+    ├── PluginDefinition.cpp
+    ├── PluginInterface.h
+    ├── QuickOpen.cpp
+    └── QuickOpen.h
+```
 
+O projeto usa UTF-8 no código-fonte (`/utf-8`) e Win32 Unicode para manter compatibilidade com nomes acentuados e a interface do Notepad++.
 
-## NPPWorkSpace
+## Compilação
 
-- O NPPWorkSpace substitui visualmente o painel nativo **Folder as Workspace** do Notepad++.
-- Pastas que chegam ao Folder as Workspace nativo (inclusive por arrastar e soltar do Explorer) são detectadas e importadas automaticamente para o NPPWorkSpace.
-- O painel nativo é mantido oculto e o NPPWorkSpace passa a ser a fonte de verdade das pastas.
-- Os botões do painel usam símbolos compactos e tooltips para manter a interface limpa e semelhante aos controles nativos do Notepad++.
-- A busca Ctrl+P continua sendo um popup flutuante e fecha automaticamente quando perde a ativação (clique fora), além de Esc.
-
-
-### Pesquisa por conteúdo
-
-No campo de pesquisa, use `>texto` para procurar o texto dentro de arquivos suportados (`.ini`, `.txt`, `.cfg`, `.xml`, `.json`, código-fonte e outros formatos de texto). A pesquisa é sem diferenciação entre maiúsculas/minúsculas.
-
-### Arrastar pastas
-
-Pastas arrastadas diretamente para o Notepad++ são capturadas pelo NPPWorkSpace e adicionadas como raízes do workspace. O painel nativo Folder as Workspace é ocultado para evitar duplicidade.
+Execute `build.bat` na raiz do projeto. Em caso de erro, a janela permanece aberta com `pause` para permitir a leitura do erro. Em caso de sucesso, o script termina automaticamente.

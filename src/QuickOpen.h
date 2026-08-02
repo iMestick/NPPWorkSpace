@@ -9,6 +9,12 @@
 #include <vector>
 #include <unordered_map>
 
+// Workspace shortcut accessors implemented by PluginDefinition.cpp.
+std::wstring NPPWorkSpace_GetToggleShortcut();
+std::wstring NPPWorkSpace_GetSearchShortcut();
+void NPPWorkSpace_SetToggleShortcut(const std::wstring& value);
+void NPPWorkSpace_SetSearchShortcut(const std::wstring& value);
+
 // Current Notepad++ docking API structure. Kept here so the plugin does not
 // need to link against Notepad++.exe or include Notepad++ private headers.
 #ifndef DWS_ICONTAB
@@ -60,7 +66,6 @@ public:
     bool isVisible() const;
 
     void refreshWorkspace();
-    void openSettings();
     void onDarkModeChanged();
 
     // Called from the plugin menu command.
@@ -89,20 +94,22 @@ private:
 
     static LRESULT CALLBACK windowProc(HWND, UINT, WPARAM, LPARAM);
     static LRESULT CALLBACK editProc(HWND, UINT, WPARAM, LPARAM);
-    static LRESULT CALLBACK settingsProc(HWND, UINT, WPARAM, LPARAM);
     static LRESULT CALLBACK searchPopupProc(HWND, UINT, WPARAM, LPARAM);
     static LRESULT CALLBACK nppProc(HWND, UINT, WPARAM, LPARAM);
+    static LRESULT CALLBACK dockHostProc(HWND, UINT, WPARAM, LPARAM);
 
     LRESULT handleMessage(HWND, UINT, WPARAM, LPARAM);
     LRESULT handleEditMessage(HWND, UINT, WPARAM, LPARAM);
-    LRESULT handleSettingsMessage(HWND, UINT, WPARAM, LPARAM);
     LRESULT handleSearchPopupMessage(HWND, UINT, WPARAM, LPARAM);
     LRESULT handleNppMessage(HWND, UINT, WPARAM, LPARAM);
+    LRESULT handleDockHostMessage(HWND, UINT, WPARAM, LPARAM);
 
     void createWindow();
     void createControls();
     void registerDock();
     void unregisterDock();
+    void refreshDockHost();
+    void releaseDockHost();
     void layoutControls(int width, int height);
 
     void rebuildWorkspaceTree(bool preserveExpansion = true);
@@ -151,12 +158,16 @@ private:
     void addFolder();
     void removeSelectedRoot();
     void newWorkspace();
-    void saveWorkspace();
+    bool saveWorkspace();
+    bool saveWorkspaceAs();
+    bool writeWorkspaceFile();
+    void openWorkspaceFile();
+    bool loadWorkspaceFile(const std::wstring& filePath);
     void loadWorkspace();
+    std::wstring getWorkspaceFilePath() const;
 
     std::vector<std::filesystem::path> getWorkspaceRootsForPanel() const;
     std::wstring getSettingsPath() const;
-    std::wstring getWorkspaceFilePath() const;
     void loadSettings();
     void saveSettings() const;
 
@@ -176,15 +187,16 @@ private:
     HWND _addFolder{};
     HWND _newWorkspace{};
     HWND _saveWorkspace{};
+    HWND _openWorkspace{};
     HWND _removeFolder{};
-    HWND _settings{};
     HWND _expandAll{};
     HWND _collapseAll{};
     HWND _status{};
-    HWND _settingsWindow{};
     HWND _searchGroup{};
     HWND _workspaceGroup{};
     HWND _tooltips{};
+    HWND _dockHost{};
+    WNDPROC _oldDockHostProc{};
     HWND _searchPopup{};
     HWND _searchPopupEdit{};
     HWND _searchPopupResults{};
@@ -196,6 +208,7 @@ private:
     WNDPROC _oldPopupSearchProc{};
 
     std::vector<std::filesystem::path> _savedRoots;
+    std::wstring _workspaceFile;
     std::vector<std::filesystem::path> _nppRoots;
     std::vector<SearchResult> _searchResults;
     std::unordered_map<HTREEITEM, NodeData> _nodeData;
