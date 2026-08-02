@@ -41,6 +41,8 @@ constexpr int ID_WORKSPACE_GROUP = 1011;
 constexpr int ID_POPUP_SEARCH = 1200;
 constexpr int ID_POPUP_RESULTS = 1201;
 constexpr UINT_PTR WORKSPACE_SYNC_TIMER = 4101;
+constexpr UINT_PTR SEARCH_DEBOUNCE_TIMER = 4102;
+constexpr UINT SEARCH_DEBOUNCE_MS = 180;
 
 constexpr int ID_NODE_DUMMY = 2000;
 constexpr int MAX_SEARCH_RESULTS = 250;
@@ -981,7 +983,11 @@ void QuickOpen::showSearchPopup()
 
 void QuickOpen::hideSearchPopup()
 {
-    if (_searchPopup) ShowWindow(_searchPopup, SW_HIDE);
+    if (_searchPopup)
+    {
+        KillTimer(_searchPopup, SEARCH_DEBOUNCE_TIMER);
+        ShowWindow(_searchPopup, SW_HIDE);
+    }
 }
 
 void QuickOpen::updatePopupSearch()
@@ -1402,7 +1408,10 @@ void QuickOpen::searchDirectory(const std::filesystem::path& root, const std::ws
         if (!query.empty() && query.front() == L'>')
         {
             const std::wstring contentQuery = query.substr(1);
-            match = !contentQuery.empty() && fileContainsText(p, contentQuery);
+            // Content search is intentionally delayed until at least two
+            // characters are present; this prevents a full workspace scan
+            // while the user is still typing the first character.
+            match = contentQuery.size() >= 2 && fileContainsText(p, contentQuery);
         }
         else
         {
@@ -1414,7 +1423,8 @@ void QuickOpen::searchDirectory(const std::filesystem::path& root, const std::ws
 
 bool QuickOpen::fileContainsText(const std::filesystem::path& file, const std::wstring& query) const
 {
-    if (query.empty()) return false;
+    if (query.size() < 2) return false;
+
     const std::wstring ext = lower(file.extension().wstring());
     static const std::array<const wchar_t*, 24> textExts = {
         L".txt", L".ini", L".cfg", L".conf", L".log", L".xml", L".json", L".csv",
@@ -1422,52 +1432,91 @@ bool QuickOpen::fileContainsText(const std::filesystem::path& file, const std::w
         L".js", L".ts", L".css", L".html", L".htm", L".md", L".yaml", L".yml"
     };
     bool allowed = false;
-    for (const auto* e : textExts) if (ext == e) { allowed = true; break; }
+    for (const auto* e : textExts)
+        if (ext == e) { allowed = true; break; }
     if (!allowed) return false;
 
     std::ifstream in(file, std::ios::binary);
     if (!in) return false;
     in.seekg(0, std::ios::end);
     const std::streamoff size = in.tellg();
-    if (size <= 0 || size > 8 * 1024 * 1024) return false;
+    // Searching huge files on every keystroke is intentionally avoided.
+    if (size <= 0 || size > 4 * 1024 * 1024) return false;
     in.seekg(0, std::ios::beg);
-    std::string bytes(static_cast<size_t>(size), '\0');
-    in.read(bytes.data(), size);
-    if (!in) return false;
 
-    std::wstring text;
-    if (bytes.size() >= 2 && static_cast<unsigned char>(bytes[0]) == 0xFF && static_cast<unsigned char>(bytes[1]) == 0xFE)
+    const std::wstring needle = lower(query);
+    if (needle.empty()) return false;
+
+    // Read in chunks instead of loading the entire file and lower-casing it.
+    // Keep a small byte overlap so matches spanning two chunks are found.
+    constexpr size_t CHUNK = 64 * 1024;
+    constexpr size_t OVERLAP = 8 * 1024;
+    std::string carry;
+    carry.reserve(OVERLAP);
+    std::string buffer(CHUNK, '\0');
+    bool first = true;
+
+    while (in)
     {
-        const wchar_t* ptr = reinterpret_cast<const wchar_t*>(bytes.data() + 2);
-        const size_t chars = (bytes.size() - 2) / sizeof(wchar_t);
-        text.assign(ptr, ptr + chars);
-    }
-    else if (bytes.size() >= 2 && static_cast<unsigned char>(bytes[0]) == 0xFE && static_cast<unsigned char>(bytes[1]) == 0xFF)
-    {
-        const size_t chars = (bytes.size() - 2) / 2;
-        text.resize(chars);
-        for (size_t i = 0; i < chars; ++i)
-            text[i] = static_cast<wchar_t>((static_cast<unsigned char>(bytes[2 + i * 2]) << 8) | static_cast<unsigned char>(bytes[3 + i * 2]));
-    }
-    else if (bytes.size() >= 3 && static_cast<unsigned char>(bytes[0]) == 0xEF && static_cast<unsigned char>(bytes[1]) == 0xBB && static_cast<unsigned char>(bytes[2]) == 0xBF)
-    {
-        text = wideFromUtf8(bytes.substr(3));
-    }
-    else
-    {
-        text = wideFromUtf8(bytes);
-        if (text.empty() && !bytes.empty())
+        in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const std::streamsize got = in.gcount();
+        if (got <= 0) break;
+
+        std::string bytes;
+        bytes.reserve(carry.size() + static_cast<size_t>(got));
+        bytes.append(carry);
+        bytes.append(buffer.data(), static_cast<size_t>(got));
+
+        std::wstring text;
+        if (first && bytes.size() >= 2 &&
+            static_cast<unsigned char>(bytes[0]) == 0xFF &&
+            static_cast<unsigned char>(bytes[1]) == 0xFE)
         {
-            const int n = MultiByteToWideChar(CP_ACP, 0, bytes.data(), static_cast<int>(bytes.size()), nullptr, 0);
-            if (n > 0)
+            const size_t chars = (bytes.size() - 2) / sizeof(wchar_t);
+            text.assign(reinterpret_cast<const wchar_t*>(bytes.data() + 2),
+                        reinterpret_cast<const wchar_t*>(bytes.data() + 2) + chars);
+        }
+        else if (first && bytes.size() >= 3 &&
+                 static_cast<unsigned char>(bytes[0]) == 0xEF &&
+                 static_cast<unsigned char>(bytes[1]) == 0xBB &&
+                 static_cast<unsigned char>(bytes[2]) == 0xBF)
+        {
+            text = wideFromUtf8(bytes.substr(3));
+        }
+        else
+        {
+            text = wideFromUtf8(bytes);
+            if (text.empty() && !bytes.empty())
             {
-                text.resize(static_cast<size_t>(n));
-                MultiByteToWideChar(CP_ACP, 0, bytes.data(), static_cast<int>(bytes.size()), text.data(), n);
+                const int n = MultiByteToWideChar(CP_ACP, 0, bytes.data(),
+                                                  static_cast<int>(bytes.size()), nullptr, 0);
+                if (n > 0)
+                {
+                    text.resize(static_cast<size_t>(n));
+                    MultiByteToWideChar(CP_ACP, 0, bytes.data(),
+                                        static_cast<int>(bytes.size()), text.data(), n);
+                }
             }
         }
+
+        if (!text.empty() && lower(text).find(needle) != std::wstring::npos)
+            return true;
+
+        first = false;
+        if (bytes.size() > OVERLAP)
+            carry.assign(bytes.data() + bytes.size() - OVERLAP, OVERLAP);
+        else
+            carry = bytes;
     }
-    if (text.empty()) return false;
-    return lower(text).find(lower(query)) != std::wstring::npos;
+    return false;
+}
+
+void QuickOpen::scheduleSearch(bool popup)
+{
+    HWND target = popup ? _searchPopup : _window;
+    if (!target) return;
+    KillTimer(target, SEARCH_DEBOUNCE_TIMER);
+    SetTimer(target, SEARCH_DEBOUNCE_TIMER, SEARCH_DEBOUNCE_MS, nullptr);
 }
 
 void QuickOpen::updateSearch()
@@ -1531,6 +1580,7 @@ void QuickOpen::showSearchResults(const std::wstring& query)
 
 void QuickOpen::clearSearchResults()
 {
+    if (_window) KillTimer(_window, SEARCH_DEBOUNCE_TIMER);
     _suppressSearch = true;
     SetWindowTextW(_search, L"");
     _suppressSearch = false;
@@ -1871,6 +1921,12 @@ LRESULT QuickOpen::handleMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
             syncNativeFolderWorkspace();
             return 0;
         }
+        if (w == SEARCH_DEBOUNCE_TIMER)
+        {
+            KillTimer(h, SEARCH_DEBOUNCE_TIMER);
+            updateSearch();
+            return 0;
+        }
         break;
 
     case WM_COMMAND:
@@ -1879,7 +1935,7 @@ LRESULT QuickOpen::handleMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
         const int code = HIWORD(w);
         if (id == ID_SEARCH && code == EN_CHANGE)
         {
-            updateSearch();
+            scheduleSearch(false);
             return 0;
         }
         if (id == ID_ADD) { addFolder(); return 0; }
@@ -2038,6 +2094,14 @@ LRESULT QuickOpen::handleSearchPopupMessage(HWND h, UINT msg, WPARAM w, LPARAM l
 {
     switch (msg)
     {
+    case WM_TIMER:
+        if (w == SEARCH_DEBOUNCE_TIMER)
+        {
+            KillTimer(h, SEARCH_DEBOUNCE_TIMER);
+            updatePopupSearch();
+            return 0;
+        }
+        break;
     case WM_SIZE:
         layoutSearchPopup();
         return 0;
@@ -2051,7 +2115,7 @@ LRESULT QuickOpen::handleSearchPopupMessage(HWND h, UINT msg, WPARAM w, LPARAM l
     case WM_COMMAND:
         if (LOWORD(w) == ID_POPUP_SEARCH && HIWORD(w) == EN_CHANGE)
         {
-            updatePopupSearch();
+            scheduleSearch(true);
             return 0;
         }
         break;

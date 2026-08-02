@@ -3,12 +3,11 @@
 #include <windows.h>
 
 NppData g_nppData{};
-FuncItem g_funcItems[3]{};
+FuncItem g_funcItems[2]{};
 
 // Default shortcuts requested for NPPWorkSpace.
 ShortcutKey g_workspaceShortcut{true, false, false, 'B'};
 ShortcutKey g_searchShortcut{true, false, false, 'P'};
-ShortcutKey g_refreshShortcut{false, false, false, 0};
 
 std::wstring shortcutToString(const ShortcutKey& key)
 {
@@ -55,10 +54,6 @@ void commandSearch()
     QuickOpen::instance().focusSearch();
 }
 
-void commandRefresh()
-{
-    QuickOpen::instance().refreshWorkspace();
-}
 
 void setText(int index, const wchar_t* text)
 {
@@ -99,9 +94,6 @@ extern "C" __declspec(dllexport) void setInfo(NppData data)
     g_funcItems[1]._pFunc = commandSearch;
     g_funcItems[1]._pShKey = &g_searchShortcut;
 
-    setText(2, L"NPPWorkSpace — Atualizar workspace");
-    g_funcItems[2]._pFunc = commandRefresh;
-    g_funcItems[2]._pShKey = &g_refreshShortcut;
 }
 
 extern "C" __declspec(dllexport) const wchar_t* getName()
@@ -111,7 +103,7 @@ extern "C" __declspec(dllexport) const wchar_t* getName()
 
 extern "C" __declspec(dllexport) FuncItem* getFuncsArray(int* n)
 {
-    if (n) *n = 3;
+    if (n) *n = 2;
     // The first plugin command is used as the docking manager's dlgID.
     QuickOpen::instance().setDockCommandId(0);
     QuickOpen::instance().registerDockPanel();

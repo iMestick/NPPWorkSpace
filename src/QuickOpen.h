@@ -142,6 +142,7 @@ private:
     void collapseAllFolders();
 
     void updateSearch();
+    void scheduleSearch(bool popup);
     void showSearchResults(const std::wstring& query);
     void clearSearchResults();
     void openSearchResult();
@@ -226,6 +227,7 @@ private:
     bool _darkMode{false};
     bool _searchOnly{false};
     bool _suppressSearch{false};
+    unsigned int _searchGeneration{0};
     bool _registeredDock{false};
     int _dockCommandId{0};
     UINT_PTR _syncTimer{0};
