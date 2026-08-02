@@ -728,12 +728,15 @@ void QuickOpen::createControls()
     ListView_SetExtendedListViewStyle(_results, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
     LVCOLUMNW col{};
     col.mask = LVCF_TEXT | LVCF_WIDTH;
-    col.cx = 230;
+    col.cx = 220;
     col.pszText = const_cast<LPWSTR>(L"Arquivo");
     ListView_InsertColumn(_results, 0, &col);
-    col.cx = 400;
-    col.pszText = const_cast<LPWSTR>(L"Caminho");
+    col.cx = 240;
+    col.pszText = const_cast<LPWSTR>(L"Pasta");
     ListView_InsertColumn(_results, 1, &col);
+    col.cx = 560;
+    col.pszText = const_cast<LPWSTR>(L"Path completo");
+    ListView_InsertColumn(_results, 2, &col);
 
     // Ask Notepad++ to apply its own native dark-mode treatment to the panel.
     SendMessageW(_npp, NPPM_DARKMODESUBCLASSANDTHEME,
@@ -932,12 +935,15 @@ void QuickOpen::createSearchPopup()
 
     LVCOLUMNW col{};
     col.mask = LVCF_TEXT | LVCF_WIDTH;
-    col.cx = 240;
+    col.cx = 220;
     col.pszText = const_cast<LPWSTR>(L"Arquivo");
     ListView_InsertColumn(_searchPopupResults, 0, &col);
-    col.cx = 440;
-    col.pszText = const_cast<LPWSTR>(L"Caminho");
+    col.cx = 240;
+    col.pszText = const_cast<LPWSTR>(L"Pasta");
     ListView_InsertColumn(_searchPopupResults, 1, &col);
+    col.cx = 560;
+    col.pszText = const_cast<LPWSTR>(L"Path completo");
+    ListView_InsertColumn(_searchPopupResults, 2, &col);
 
     HWND hint = CreateWindowExW(0, L"STATIC", L"Enter abrir  |  Esc fechar",
         WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
@@ -1012,11 +1018,18 @@ void QuickOpen::showPopupSearchResults(const std::wstring& query)
     }
     std::sort(found.begin(), found.end(), [&](const SearchResult& a, const SearchResult& b)
     {
-        if (!query.empty() && query.front() == L'>') return lower(a.relative) < lower(b.relative);
+        if (!query.empty() && query.front() == L'>')
+        {
+            const std::wstring af = lower(a.folder + L"\\" + a.fileName);
+            const std::wstring bf = lower(b.folder + L"\\" + b.fileName);
+            return af < bf;
+        }
         const int as = (std::max)(fuzzyScore(query, a.path.filename().wstring()), fuzzyScore(query, a.relative));
         const int bs = (std::max)(fuzzyScore(query, b.path.filename().wstring()), fuzzyScore(query, b.relative));
         if (as != bs) return as > bs;
-        return lower(a.relative) < lower(b.relative);
+        const std::wstring af = lower(a.folder + L"\\" + a.fileName);
+        const std::wstring bf = lower(b.folder + L"\\" + b.fileName);
+        return af < bf;
     });
     _searchResults = found;
     ListView_DeleteAllItems(_searchPopupResults);
@@ -1025,10 +1038,13 @@ void QuickOpen::showPopupSearchResults(const std::wstring& query)
         LVITEMW item{};
         item.mask = LVIF_TEXT;
         item.iItem = static_cast<int>(i);
-        item.pszText = const_cast<LPWSTR>(_searchResults[i].path.filename().c_str());
+        item.pszText = const_cast<LPWSTR>(_searchResults[i].fileName.c_str());
         ListView_InsertItem(_searchPopupResults, &item);
         ListView_SetItemText(_searchPopupResults, static_cast<int>(i), 1,
-                             const_cast<LPWSTR>(_searchResults[i].relative.c_str()));
+                             const_cast<LPWSTR>(_searchResults[i].folder.c_str()));
+        const std::wstring fullPath = _searchResults[i].path.wstring();
+        ListView_SetItemText(_searchPopupResults, static_cast<int>(i), 2,
+                             const_cast<LPWSTR>(fullPath.c_str()));
     }
     if (!_searchResults.empty())
         ListView_SetItemState(_searchPopupResults, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
@@ -1401,9 +1417,20 @@ void QuickOpen::searchDirectory(const std::filesystem::path& root, const std::ws
         }
         if (!it->is_regular_file(itemEc)) continue;
 
-        const std::wstring file = p.filename().wstring();
+        std::wstring file = p.filename().wstring();
+        // A regular file should always have a filename. Keep a robust fallback
+        // for unusual filesystem entries so the result row can never be blank.
+        if (file.empty()) file = p.stem().wstring();
+        if (file.empty()) file = p.wstring();
+
         std::error_code relEc;
-        const std::wstring rel = std::filesystem::relative(p, root, relEc).wstring();
+        std::filesystem::path relPath = std::filesystem::relative(p, root, relEc);
+        if (relEc || relPath.empty()) relPath = p.filename();
+        const std::wstring rel = relPath.wstring();
+        std::filesystem::path folderPath = relPath.parent_path();
+        std::wstring folder = folderPath.empty() ? L"\\" : L"\\" + folderPath.wstring();
+        // Normalize the folder separator for a stable Windows presentation.
+        std::replace(folder.begin(), folder.end(), L'/', L'\\');
         bool match = false;
         if (!query.empty() && query.front() == L'>')
         {
@@ -1417,7 +1444,7 @@ void QuickOpen::searchDirectory(const std::filesystem::path& root, const std::ws
         {
             match = fuzzyScore(query, file) >= 0 || fuzzyScore(query, rel) >= 0;
         }
-        if (match) results.push_back({p, relEc ? p.wstring() : rel});
+        if (match) results.push_back({p, file, folder, rel});
     }
 }
 
@@ -1549,11 +1576,18 @@ void QuickOpen::showSearchResults(const std::wstring& query)
 
     std::sort(found.begin(), found.end(), [&](const SearchResult& a, const SearchResult& b)
     {
-        if (!query.empty() && query.front() == L'>') return lower(a.relative) < lower(b.relative);
+        if (!query.empty() && query.front() == L'>')
+        {
+            const std::wstring af = lower(a.folder + L"\\" + a.fileName);
+            const std::wstring bf = lower(b.folder + L"\\" + b.fileName);
+            return af < bf;
+        }
         const int as = (std::max)(fuzzyScore(query, a.path.filename().wstring()), fuzzyScore(query, a.relative));
         const int bs = (std::max)(fuzzyScore(query, b.path.filename().wstring()), fuzzyScore(query, b.relative));
         if (as != bs) return as > bs;
-        return lower(a.relative) < lower(b.relative);
+        const std::wstring af = lower(a.folder + L"\\" + a.fileName);
+        const std::wstring bf = lower(b.folder + L"\\" + b.fileName);
+        return af < bf;
     });
 
     _searchResults = std::move(found);
@@ -1563,10 +1597,13 @@ void QuickOpen::showSearchResults(const std::wstring& query)
         LVITEMW item{};
         item.mask = LVIF_TEXT;
         item.iItem = static_cast<int>(i);
-        item.pszText = const_cast<LPWSTR>(_searchResults[i].path.filename().c_str());
+        item.pszText = const_cast<LPWSTR>(_searchResults[i].fileName.c_str());
         ListView_InsertItem(_results, &item);
         ListView_SetItemText(_results, static_cast<int>(i), 1,
-                             const_cast<LPWSTR>(_searchResults[i].relative.c_str()));
+                             const_cast<LPWSTR>(_searchResults[i].folder.c_str()));
+        const std::wstring fullPath = _searchResults[i].path.wstring();
+        ListView_SetItemText(_results, static_cast<int>(i), 2,
+                             const_cast<LPWSTR>(fullPath.c_str()));
     }
 
     ShowWindow(_tree, SW_HIDE);

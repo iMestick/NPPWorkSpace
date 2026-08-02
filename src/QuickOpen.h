@@ -89,6 +89,8 @@ private:
     struct SearchResult
     {
         std::filesystem::path path;
+        std::wstring fileName;
+        std::wstring folder;
         std::wstring relative;
     };
 
