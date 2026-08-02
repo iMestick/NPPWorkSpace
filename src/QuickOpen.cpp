@@ -1403,23 +1403,25 @@ void QuickOpen::handleTreeDoubleClick(LPNMTREEVIEWW tv)
 {
     if (!tv) return;
 
-    // A double click is an explicit open action. If the clicked file is part
-    // of a multi-selection, open the whole selection; otherwise open it alone.
     const HTREEITEM item = tv->itemNew.hItem;
     auto it = _nodeData.find(item);
     if (it == _nodeData.end()) return;
 
+    // A double-click on any selected file opens the whole current selection.
+    // If the clicked file is not selected, make it the sole selection first.
     if (it->second.type == NodeType::File)
     {
         if (!isTreeFileSelected(item))
         {
             _selectedTreeFiles.clear();
             _selectedTreeFiles.insert(item);
+            InvalidateRect(_tree, nullptr, TRUE);
         }
         openSelectedTreeFiles();
         return;
     }
 
+    // Folders keep the normal expand/collapse behavior.
     openTreeSelection();
 }
 
@@ -2143,6 +2145,11 @@ LRESULT QuickOpen::handleMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
                 if (clicked && (hit.flags & TVHT_ONITEM))
                 {
                     const bool ctrlDown = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+
+                    // Keep the native TreeView focus/selection synchronized with
+                    // our custom multi-selection. Ctrl+click preserves the other
+                    // selected files; a normal click starts a new selection.
+                    TreeView_SelectItem(_tree, clicked);
                     toggleTreeFileSelection(clicked, ctrlDown);
                 }
                 return 0;
@@ -2162,16 +2169,16 @@ LRESULT QuickOpen::handleMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
                     return CDRF_DODEFAULT;
                 }
             }
+            if (hdr->code == TVN_ITEMEXPANDINGW) { handleTreeItemExpanding(const_cast<NMTREEVIEWW*>(tv)); return 0; }
             if (hdr->code == TVN_KEYDOWN)
             {
-                const auto* key = reinterpret_cast<const NMTVKEYDOWN*>(hdr);
-                if (key && key->wVKey == VK_RETURN)
+                const auto* kd = reinterpret_cast<const NMTVKEYDOWN*>(l);
+                if (kd && kd->wVKey == VK_RETURN)
                 {
                     openTreeSelection();
                     return 0;
                 }
             }
-            if (hdr->code == TVN_ITEMEXPANDINGW) { handleTreeItemExpanding(const_cast<NMTREEVIEWW*>(tv)); return 0; }
             if (hdr->code == NM_RCLICK)
             {
                 POINT pt{};
@@ -2198,10 +2205,19 @@ LRESULT QuickOpen::handleMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
         }
         else if (hdr->idFrom == ID_RESULTS)
         {
-            if (hdr->code == NM_DBLCLK)
+            if (hdr->code == NM_DBLCLK || hdr->code == NM_RETURN || hdr->code == LVN_ITEMACTIVATE)
             {
                 openSelectedResults(_results);
                 return 0;
+            }
+            if (hdr->code == LVN_KEYDOWN)
+            {
+                const auto* kd = reinterpret_cast<const NMLVKEYDOWN*>(l);
+                if (kd && kd->wVKey == VK_RETURN)
+                {
+                    openSelectedResults(_results);
+                    return 0;
+                }
             }
             if (hdr->code == NM_RCLICK)
             {
@@ -2257,7 +2273,7 @@ LRESULT QuickOpen::handleEditMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
     if (msg == WM_KEYDOWN)
     {
         if (w == VK_ESCAPE) { clearSearchResults(); return 0; }
-        if (w == VK_RETURN && _searchOnly) { openSearchResult(); return 0; }
+        if (w == VK_RETURN && _searchOnly) { openSelectedResults(_results); return 0; }
         if (w == VK_DOWN && _searchOnly) { SetFocus(_results); return 0; }
     }
     return _oldSearchProc ? CallWindowProcW(_oldSearchProc, h, msg, w, l)
