@@ -292,6 +292,7 @@ void QuickOpen::destroy()
     }
 
     releaseDockHost();
+    releaseDockSplitters();
     unregisterDock();
 
     if (_window)
@@ -379,6 +380,7 @@ void QuickOpen::registerDock()
     {
         _registeredDock = true;
         refreshDockHost();
+        refreshDockSplitters();
     }
 }
 
@@ -410,12 +412,42 @@ LRESULT CALLBACK QuickOpen::dockHostProc(HWND h, UINT msg, WPARAM w, LPARAM l)
     return g_instance->handleDockHostMessage(h, msg, w, l);
 }
 
+LRESULT CALLBACK QuickOpen::dockSplitterProc(HWND h, UINT msg, WPARAM w, LPARAM l)
+{
+    if (!g_instance) return DefWindowProcW(h, msg, w, l);
+    return g_instance->handleDockSplitterMessage(h, msg, w, l);
+}
+
 namespace
 {
-constexpr LONG WORKSPACE_MIN_WIDTH = 340;
-constexpr LONG WORKSPACE_MAX_WIDTH = 620;
-constexpr LONG WORKSPACE_MIN_HEIGHT = 260;
-constexpr LONG WORKSPACE_MAX_HEIGHT = 1000;
+constexpr int WORKSPACE_MIN_WIDTH = 340;
+constexpr int WORKSPACE_MAX_WIDTH = 620;
+constexpr int WORKSPACE_MIN_HEIGHT = 260;
+constexpr int WORKSPACE_MAX_HEIGHT = 1000;
+
+enum class DockSide { None, Left, Right, Top, Bottom };
+
+DockSide getDockSideForSplitter(HWND panel, HWND splitter)
+{
+    if (!panel || !splitter) return DockSide::None;
+    HWND container = GetParent(panel);
+    if (!container) return DockSide::None;
+
+    RECT rcContainer{}, rcSplitter{};
+    if (!GetWindowRect(container, &rcContainer) || !GetWindowRect(splitter, &rcSplitter))
+        return DockSide::None;
+
+    constexpr LONG tolerance = 8;
+    if (rcSplitter.left >= rcContainer.right - tolerance && rcSplitter.left <= rcContainer.right + tolerance)
+        return DockSide::Left;
+    if (rcSplitter.right <= rcContainer.left + tolerance && rcSplitter.right >= rcContainer.left - tolerance)
+        return DockSide::Right;
+    if (rcSplitter.top >= rcContainer.bottom - tolerance && rcSplitter.top <= rcContainer.bottom + tolerance)
+        return DockSide::Top;
+    if (rcSplitter.bottom <= rcContainer.top + tolerance && rcSplitter.bottom >= rcContainer.top - tolerance)
+        return DockSide::Bottom;
+    return DockSide::None;
+}
 
 bool isFloatingDockHost(HWND h)
 {
@@ -429,12 +461,12 @@ void clampWorkspaceMinMaxInfo(HWND h, MINMAXINFO* info)
 {
     if (!info) return;
     const bool floating = isFloatingDockHost(h);
-    info->ptMinTrackSize.x = (std::max)(info->ptMinTrackSize.x, WORKSPACE_MIN_WIDTH);
-    info->ptMaxTrackSize.x = (std::min)(info->ptMaxTrackSize.x, WORKSPACE_MAX_WIDTH);
+    info->ptMinTrackSize.x = (std::max)(info->ptMinTrackSize.x, static_cast<LONG>(WORKSPACE_MIN_WIDTH));
+    info->ptMaxTrackSize.x = (std::min)(info->ptMaxTrackSize.x, static_cast<LONG>(WORKSPACE_MAX_WIDTH));
     if (floating)
     {
-        info->ptMinTrackSize.y = (std::max)(info->ptMinTrackSize.y, WORKSPACE_MIN_HEIGHT);
-        info->ptMaxTrackSize.y = (std::min)(info->ptMaxTrackSize.y, WORKSPACE_MAX_HEIGHT);
+        info->ptMinTrackSize.y = (std::max)(info->ptMinTrackSize.y, static_cast<LONG>(WORKSPACE_MIN_HEIGHT));
+        info->ptMaxTrackSize.y = (std::min)(info->ptMaxTrackSize.y, static_cast<LONG>(WORKSPACE_MAX_HEIGHT));
     }
 }
 
@@ -452,6 +484,140 @@ void clampWorkspaceWindowPos(HWND h, WINDOWPOS* pos)
         pos->cy = (std::max)(minHeight, (std::min)(maxHeight, pos->cy));
     }
 }
+}
+
+void QuickOpen::refreshDockSplitters()
+{
+    if (!_npp) return;
+
+    auto hookClass = [this](const wchar_t* className)
+    {
+        HWND h = nullptr;
+        while ((h = FindWindowExW(_npp, h, className, nullptr)) != nullptr)
+        {
+            bool already = false;
+            for (const auto& hook : _dockSplitters)
+            {
+                if (hook.hwnd == h) { already = true; break; }
+            }
+            if (already) continue;
+
+            WNDPROC oldProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
+                h, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&QuickOpen::dockSplitterProc)));
+            if (oldProc)
+                _dockSplitters.push_back({h, oldProc});
+        }
+    };
+
+    // Notepad++ creates these two native DockingSplitter classes. The splitter,
+    // not the plugin child window, owns the mouse-driven resize operation.
+    // This is important for docked panels: constraining only the plugin HWND
+    // cannot stop DockingManager from moving the splitter past the panel.
+    hookClass(L"wedockspliter");
+    hookClass(L"nsdockspliter");
+}
+
+void QuickOpen::releaseDockSplitters()
+{
+    for (auto it = _dockSplitters.rbegin(); it != _dockSplitters.rend(); ++it)
+    {
+        if (it->hwnd && IsWindow(it->hwnd) && it->oldProc)
+            SetWindowLongPtrW(it->hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(it->oldProc));
+    }
+    _dockSplitters.clear();
+    _activeSplitter = nullptr;
+    _splitterTracking = false;
+}
+
+LRESULT QuickOpen::handleDockSplitterMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
+{
+    WNDPROC oldProc = nullptr;
+    for (const auto& hook : _dockSplitters)
+    {
+        if (hook.hwnd == h) { oldProc = hook.oldProc; break; }
+    }
+    if (!oldProc) return DefWindowProcW(h, msg, w, l);
+
+    if (msg == WM_LBUTTONDOWN)
+    {
+        GetCursorPos(&_lastSplitterCursor);
+        _activeSplitter = h;
+        _splitterTracking = true;
+    }
+    else if (msg == WM_MOUSEMOVE && _splitterTracking && _activeSplitter == h && (w & MK_LBUTTON))
+    {
+        HWND container = _window ? GetParent(_window) : nullptr;
+        DockSide side = getDockSideForSplitter(_window, h);
+        if (container && side != DockSide::None)
+        {
+            RECT rc{};
+            GetWindowRect(container, &rc);
+            POINT cursor{};
+            GetCursorPos(&cursor);
+
+            const int dx = cursor.x - _lastSplitterCursor.x;
+            const int dy = cursor.y - _lastSplitterCursor.y;
+            int current = 0;
+            int delta = 0;
+            int minSize = 0;
+            int maxSize = 0;
+
+            switch (side)
+            {
+            case DockSide::Left:
+                current = rc.right - rc.left;
+                delta = dx;
+                minSize = WORKSPACE_MIN_WIDTH;
+                maxSize = WORKSPACE_MAX_WIDTH;
+                break;
+            case DockSide::Right:
+                current = rc.right - rc.left;
+                delta = -dx;
+                minSize = WORKSPACE_MIN_WIDTH;
+                maxSize = WORKSPACE_MAX_WIDTH;
+                break;
+            case DockSide::Top:
+                current = rc.bottom - rc.top;
+                delta = dy;
+                minSize = WORKSPACE_MIN_HEIGHT;
+                maxSize = WORKSPACE_MAX_HEIGHT;
+                break;
+            case DockSide::Bottom:
+                current = rc.bottom - rc.top;
+                delta = -dy;
+                minSize = WORKSPACE_MIN_HEIGHT;
+                maxSize = WORKSPACE_MAX_HEIGHT;
+                break;
+            default:
+                break;
+            }
+
+            const int requested = current + delta;
+            const int clamped = (std::max)(minSize, (std::min)(maxSize, requested));
+            if (clamped != requested)
+            {
+                const int allowedDelta = clamped - current;
+                POINT corrected = cursor;
+                if (side == DockSide::Left) corrected.x = _lastSplitterCursor.x + allowedDelta;
+                else if (side == DockSide::Right) corrected.x = _lastSplitterCursor.x - allowedDelta;
+                else if (side == DockSide::Top) corrected.y = _lastSplitterCursor.y + allowedDelta;
+                else if (side == DockSide::Bottom) corrected.y = _lastSplitterCursor.y - allowedDelta;
+
+                SetCursorPos(corrected.x, corrected.y);
+                GetCursorPos(&cursor);
+            }
+
+            _lastSplitterCursor = cursor;
+        }
+    }
+    else if (msg == WM_LBUTTONUP || msg == WM_NCLBUTTONUP ||
+             (msg == WM_CAPTURECHANGED && _splitterTracking))
+    {
+        _splitterTracking = false;
+        _activeSplitter = nullptr;
+    }
+
+    return CallWindowProcW(oldProc, h, msg, w, l);
 }
 
 LRESULT QuickOpen::handleDockHostMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
@@ -1701,6 +1867,7 @@ LRESULT QuickOpen::handleMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
         if (w == WORKSPACE_SYNC_TIMER)
         {
             refreshDockHost();
+            refreshDockSplitters();
             syncNativeFolderWorkspace();
             return 0;
         }

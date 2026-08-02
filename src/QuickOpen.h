@@ -97,12 +97,14 @@ private:
     static LRESULT CALLBACK searchPopupProc(HWND, UINT, WPARAM, LPARAM);
     static LRESULT CALLBACK nppProc(HWND, UINT, WPARAM, LPARAM);
     static LRESULT CALLBACK dockHostProc(HWND, UINT, WPARAM, LPARAM);
+    static LRESULT CALLBACK dockSplitterProc(HWND, UINT, WPARAM, LPARAM);
 
     LRESULT handleMessage(HWND, UINT, WPARAM, LPARAM);
     LRESULT handleEditMessage(HWND, UINT, WPARAM, LPARAM);
     LRESULT handleSearchPopupMessage(HWND, UINT, WPARAM, LPARAM);
     LRESULT handleNppMessage(HWND, UINT, WPARAM, LPARAM);
     LRESULT handleDockHostMessage(HWND, UINT, WPARAM, LPARAM);
+    LRESULT handleDockSplitterMessage(HWND, UINT, WPARAM, LPARAM);
 
     void createWindow();
     void createControls();
@@ -110,6 +112,8 @@ private:
     void unregisterDock();
     void refreshDockHost();
     void releaseDockHost();
+    void refreshDockSplitters();
+    void releaseDockSplitters();
     void layoutControls(int width, int height);
 
     void rebuildWorkspaceTree(bool preserveExpansion = true);
@@ -197,6 +201,12 @@ private:
     HWND _tooltips{};
     HWND _dockHost{};
     WNDPROC _oldDockHostProc{};
+
+    struct DockSplitterHook { HWND hwnd{}; WNDPROC oldProc{}; };
+    std::vector<DockSplitterHook> _dockSplitters;
+    HWND _activeSplitter{};
+    POINT _lastSplitterCursor{};
+    bool _splitterTracking{false};
     HWND _searchPopup{};
     HWND _searchPopupEdit{};
     HWND _searchPopupResults{};
