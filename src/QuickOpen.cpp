@@ -1228,11 +1228,15 @@ void QuickOpen::showSearchPopup()
 {
     createSearchPopup();
     if (!_searchPopup) return;
-    // Every Ctrl+P invocation starts a fresh search.
+    // Ctrl+P must reuse the already-built index. Rebuilding/invalidation on every
+    // invocation made the first query race with the index worker and caused
+    // subsequent queries to appear stale or empty. The index is invalidated only
+    // when the workspace/scope actually changes.
     if (_searchPopupEdit) SetWindowTextW(_searchPopupEdit, L"");
     if (_searchPopupResults) ListView_DeleteAllItems(_searchPopupResults);
-    _searchIndexValid = false;
     _searchResults.clear();
+    if (!_searchIndexValid && !_searchIndexBuilding)
+        startSearchIndexBuild();
     layoutSearchPopup();
     RECT npp{};
     GetWindowRect(_npp, &npp);
