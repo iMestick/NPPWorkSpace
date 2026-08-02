@@ -9,6 +9,9 @@
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
+#include <thread>
+#include <atomic>
+#include <memory>
 
 // Workspace shortcut accessors implemented by PluginDefinition.cpp.
 std::wstring NPPWorkSpace_GetToggleShortcut();
@@ -100,6 +103,9 @@ private:
         std::wstring fileName;
         std::wstring folder;
         std::wstring relative;
+        // Cached lowercase keys keep interactive filename search allocation-free.
+        std::wstring fileNameLower;
+        std::wstring relativeLower;
     };
 
     static LRESULT CALLBACK windowProc(HWND, UINT, WPARAM, LPARAM);
@@ -155,7 +161,7 @@ private:
     void handleTreeDoubleClick(LPNMTREEVIEWW tv);
     void handleTreeItemExpanding(LPNMTREEVIEWW tv);
     void showTreeContextMenu(HTREEITEM item, POINT screenPoint);
-    void createContainer();
+    void createContainer(POINT screenPoint = POINT{-1, -1});
     void renameContainer(size_t index);
     void removeContainer(size_t index);
     void moveFolderToContainer(const std::filesystem::path& folder, size_t containerIndex);
@@ -172,6 +178,14 @@ private:
     void hideSearchPopup();
     void updatePopupSearch();
     void showPopupSearchResults(const std::wstring& query);
+    void showSearchScopeMenu(HWND owner, POINT screenPoint);
+    void applySearchScopeCommand(UINT id);
+    bool isSearchPathEnabled(const std::filesystem::path& path) const;
+    void invalidateSearchIndex();
+    void startSearchIndexBuild();
+    void finishSearchIndexBuild(std::vector<SearchResult>* built);
+    void startContentSearch(const std::wstring& query, bool popup);
+    void finishContentSearch(std::vector<SearchResult>* found, bool popup);
     void openPopupSearchResult();
     void layoutSearchPopup();
     void searchDirectory(const std::filesystem::path& root, const std::wstring& query,
@@ -179,6 +193,7 @@ private:
     bool fileContainsText(const std::filesystem::path& file, const std::wstring& query) const;
     void addDroppedFolders(HDROP drop);
     static int fuzzyScore(const std::wstring& query, const std::wstring& candidate);
+    static int fuzzyScoreLower(const std::wstring& queryLower, const std::wstring& candidateLower);
     static std::wstring lower(std::wstring value);
 
     void addFolder();
@@ -221,6 +236,7 @@ private:
     HWND _createContainer{};
     HWND _status{};
     HWND _searchGroup{};
+    HWND _searchScopeButton{};
     HWND _workspaceGroup{};
     HWND _tooltips{};
     HWND _dockHost{};
@@ -234,10 +250,15 @@ private:
     HWND _searchPopup{};
     HWND _searchPopupEdit{};
     HWND _searchPopupResults{};
+    HWND _searchPopupScopeButton{};
 
     HFONT _font{};
     HFONT _titleFont{};
     HFONT _symbolFont{};
+    HBRUSH _backgroundBrush{};
+    COLORREF _backgroundColor{};
+    COLORREF _textColor{};
+    COLORREF _edgeColor{};
     WNDPROC _oldSearchProc{};
     WNDPROC _oldPopupSearchProc{};
 
@@ -248,6 +269,28 @@ private:
     std::vector<SearchResult> _searchResults;
     std::unordered_map<HTREEITEM, NodeData> _nodeData;
     std::unordered_set<HTREEITEM> _selectedTreeFiles;
+
+    // Search scope: empty means all workspace roots are enabled.
+    std::unordered_set<std::wstring> _searchDisabledPaths;
+    std::unordered_map<UINT, std::filesystem::path> _scopeMenuFolders;
+    std::unordered_map<UINT, size_t> _scopeMenuContainers;
+    UINT _nextScopeMenuId{50000};
+
+    // File index is built off the UI thread so typing never walks the whole
+    // workspace synchronously.
+    std::thread _searchIndexThread;
+    std::thread _searchQueryThread;
+    std::atomic<bool> _searchIndexBuilding{false};
+    std::atomic<unsigned int> _searchIndexGeneration{0};
+    std::vector<SearchResult> _searchIndex;
+    std::shared_ptr<const std::vector<SearchResult>> _searchIndexSnapshot;
+    std::atomic<unsigned int> _searchQueryGeneration{0};
+    std::atomic<bool> _searchQueryRunning{false};
+    std::wstring _pendingContentQuery;
+    bool _pendingContentPopup{false};
+    std::wstring _runningContentQuery;
+    bool _runningContentPopup{false};
+    bool _searchIndexValid{false};
 
     bool _darkMode{false};
     bool _searchOnly{false};

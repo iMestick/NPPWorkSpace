@@ -10,11 +10,17 @@
 #include <system_error>
 #include <shellapi.h>
 #include <commdlg.h>
+#include <uxtheme.h>
 #include <shlobj.h>
 #include <regex>
 #include <sstream>
+#include <thread>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
 
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "uxtheme.lib")
 #pragma comment(lib, "shell32.lib")
 
 namespace
@@ -39,12 +45,16 @@ constexpr int ID_CREATE_CONTAINER = 1016;
 constexpr int ID_OPEN_SELECTED = 1015;
 constexpr int ID_STATUS = 1009;
 constexpr int ID_SEARCH_GROUP = 1010;
+constexpr int ID_SEARCH_SCOPE = 1017;
 constexpr int ID_WORKSPACE_GROUP = 1011;
 constexpr int ID_POPUP_SEARCH = 1200;
 constexpr int ID_POPUP_RESULTS = 1201;
 constexpr UINT_PTR WORKSPACE_SYNC_TIMER = 4101;
 constexpr UINT_PTR SEARCH_DEBOUNCE_TIMER = 4102;
-constexpr UINT SEARCH_DEBOUNCE_MS = 180;
+constexpr UINT SEARCH_DEBOUNCE_MS = 220;
+constexpr UINT WM_SEARCH_INDEX_READY = WM_APP + 0x5A1;
+constexpr size_t MAX_CONTENT_FILE_SIZE = 16ull * 1024ull * 1024ull;
+constexpr size_t CONTENT_CHUNK_SIZE = 1024ull * 1024ull;
 
 constexpr int ID_NODE_DUMMY = 2000;
 constexpr int MAX_SEARCH_RESULTS = 250;
@@ -219,7 +229,15 @@ bool chooseFolder(HWND owner, std::filesystem::path& result)
 struct TextPromptState
 {
     std::wstring value;
+    HWND npp{};
+    HFONT font{};
+    HFONT titleFont{};
+    HBRUSH backgroundBrush{};
+    COLORREF background{};
+    COLORREF text{};
+    COLORREF edge{};
     bool accepted{false};
+    POINT screenPoint{-1, -1};
 };
 
 INT_PTR CALLBACK textPromptProc(HWND dlg, UINT msg, WPARAM w, LPARAM l)
@@ -229,12 +247,84 @@ INT_PTR CALLBACK textPromptProc(HWND dlg, UINT msg, WPARAM w, LPARAM l)
     {
         state = reinterpret_cast<TextPromptState*>(l);
         SetWindowLongPtrW(dlg, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+
+        NppDarkMode::Colors colors{};
+        const bool dark = state->npp && SendMessageW(state->npp, NPPM_ISDARKMODEENABLED, 0, 0) != FALSE;
+        bool themed = dark && state->npp &&
+            SendMessageW(state->npp, NPPM_GETDARKMODECOLORS, sizeof(colors), reinterpret_cast<LPARAM>(&colors)) != FALSE;
+        if (!themed)
+        {
+            colors.background = GetSysColor(COLOR_BTNFACE);
+            colors.pureBackground = GetSysColor(COLOR_WINDOW);
+            colors.text = GetSysColor(COLOR_WINDOWTEXT);
+            colors.edge = GetSysColor(COLOR_BTNSHADOW);
+        }
+        state->background = colors.background;
+        state->text = colors.text;
+        state->edge = colors.edge;
+        state->backgroundBrush = CreateSolidBrush(colors.background);
+
+        // Let Notepad++ apply the exact same dark/light control theme used by
+        // its own dialogs, while still keeping this dialog independent.
+        if (state->npp)
+        {
+            for (HWND child : {dlg, GetDlgItem(dlg, 1000), GetDlgItem(dlg, 1001),
+                               GetDlgItem(dlg, IDOK), GetDlgItem(dlg, IDCANCEL)})
+            {
+                if (child)
+                    SendMessageW(state->npp, NPPM_DARKMODESUBCLASSANDTHEME,
+                                 static_cast<WPARAM>(NppDarkMode::dmfHandleChange), reinterpret_cast<LPARAM>(child));
+            }
+        }
+
+        if (state->font)
+        {
+            for (HWND child : {GetDlgItem(dlg, 1000), GetDlgItem(dlg, 1001),
+                               GetDlgItem(dlg, IDOK), GetDlgItem(dlg, IDCANCEL)})
+            {
+                if (child) SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(state->font), TRUE);
+            }
+        }
+        if (state->titleFont)
+            SendMessageW(GetDlgItem(dlg, 1000), WM_SETFONT, reinterpret_cast<WPARAM>(state->titleFont), TRUE);
+
         SetDlgItemTextW(dlg, 1001, state->value.c_str());
+
+        // Open the compact prompt close to the point that triggered it.
+        if (state->screenPoint.x >= 0 && state->screenPoint.y >= 0)
+        {
+            RECT rc{};
+            GetWindowRect(dlg, &rc);
+            const int w = rc.right - rc.left;
+            const int h = rc.bottom - rc.top;
+            HMONITOR monitor = MonitorFromPoint(state->screenPoint, MONITOR_DEFAULTTONEAREST);
+            MONITORINFO mi{sizeof(mi)};
+            GetMonitorInfoW(monitor, &mi);
+            int x = state->screenPoint.x + 10;
+            int y = state->screenPoint.y + 10;
+            if (x + w > mi.rcWork.right) x = state->screenPoint.x - w - 10;
+            if (y + h > mi.rcWork.bottom) y = state->screenPoint.y - h - 10;
+            x = (std::max)(static_cast<int>(mi.rcWork.left), (std::min)(x, static_cast<int>(mi.rcWork.right) - w));
+            y = (std::max)(static_cast<int>(mi.rcWork.top), (std::min)(y, static_cast<int>(mi.rcWork.bottom) - h));
+            SetWindowPos(dlg, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+
         SetFocus(GetDlgItem(dlg, 1001));
         SendDlgItemMessageW(dlg, 1001, EM_SETSEL, 0, -1);
         return FALSE;
     }
     if (!state) return FALSE;
+
+    if (msg == WM_CTLCOLORDLG || msg == WM_CTLCOLORSTATIC || msg == WM_CTLCOLOREDIT)
+    {
+        HDC dc = reinterpret_cast<HDC>(w);
+        SetTextColor(dc, state->text);
+        SetBkColor(dc, state->background);
+        if (msg == WM_CTLCOLORSTATIC)
+            SetBkMode(dc, TRANSPARENT);
+        return reinterpret_cast<INT_PTR>(state->backgroundBrush);
+    }
+
     if (msg == WM_COMMAND)
     {
         if (LOWORD(w) == IDOK)
@@ -253,53 +343,91 @@ INT_PTR CALLBACK textPromptProc(HWND dlg, UINT msg, WPARAM w, LPARAM l)
             return TRUE;
         }
     }
+    if (msg == WM_CLOSE)
+    {
+        state->accepted = false;
+        EndDialog(dlg, IDCANCEL);
+        return TRUE;
+    }
+    if (msg == WM_DESTROY)
+    {
+        if (state->backgroundBrush)
+        {
+            DeleteObject(state->backgroundBrush);
+            state->backgroundBrush = nullptr;
+        }
+    }
     return FALSE;
 }
 
-bool promptForText(HWND owner, const wchar_t* title, const wchar_t* prompt, std::wstring& value)
+bool promptForText(HWND owner, HWND npp, HFONT font, HFONT titleFont,
+                   const wchar_t* title, const wchar_t* prompt, std::wstring& value,
+                   POINT screenPoint)
 {
     struct DialogBuffer
     {
         DLGTEMPLATE dlg{};
-        WORD menu{0}, className{0};
-        wchar_t title[64]{};
-        WORD pointSize{9};
-        wchar_t font[32]{};
     };
+
+    // Compact prompt sized like a small native Notepad++ utility dialog.
     std::vector<BYTE> data(2048, 0);
     auto* dlg = reinterpret_cast<DLGTEMPLATE*>(data.data());
     dlg->style = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_SETFONT;
     dlg->dwExtendedStyle = 0;
     dlg->cdit = 4;
-    dlg->x = 0; dlg->y = 0; dlg->cx = 260; dlg->cy = 92;
+    dlg->x = 0; dlg->y = 0; dlg->cx = 250; dlg->cy = 88;
+
     WORD* p = reinterpret_cast<WORD*>(dlg + 1);
     *p++ = 0; *p++ = 0;
     const wchar_t* t = title;
     while ((*p++ = static_cast<WORD>(*t++)) != 0) {}
-    *p++ = 9;
-    const wchar_t* font = L"Segoe UI";
-    while ((*p++ = static_cast<WORD>(*font++)) != 0) {}
 
-    auto alignDword = [&p]() { p = reinterpret_cast<WORD*>((reinterpret_cast<ULONG_PTR>(p) + 3) & ~static_cast<ULONG_PTR>(3)); };
-    auto addControl = [&](DWORD style, short x, short y, short cx, short cy, WORD id, LPCWSTR cls, LPCWSTR text)
+    // The actual font is applied to every control at WM_INITDIALOG. The
+    // template still needs a valid face name for Win32 dialog creation.
+    *p++ = 9;
+    const wchar_t* fontName = L"Segoe UI";
+    while ((*p++ = static_cast<WORD>(*fontName++)) != 0) {}
+
+    auto alignDword = [&p]()
+    {
+        p = reinterpret_cast<WORD*>((reinterpret_cast<ULONG_PTR>(p) + 3) & ~static_cast<ULONG_PTR>(3));
+    };
+    auto addControl = [&](DWORD style, short x, short y, short cx, short cy, WORD id,
+                          LPCWSTR cls, LPCWSTR text)
     {
         alignDword();
         auto* item = reinterpret_cast<DLGITEMTEMPLATE*>(p);
-        item->style = style; item->dwExtendedStyle = 0; item->x = x; item->y = y; item->cx = cx; item->cy = cy; item->id = id;
+        item->style = style;
+        item->dwExtendedStyle = 0;
+        item->x = x; item->y = y; item->cx = cx; item->cy = cy; item->id = id;
         p = reinterpret_cast<WORD*>(item + 1);
-        if (cls[0] == L'\0') { *p++ = 0xFFFF; *p++ = 0x0082; }
-        else { while ((*p++ = static_cast<WORD>(*cls++)) != 0) {} }
-        if (text) { while ((*p++ = static_cast<WORD>(*text++)) != 0) {} }
+        if (cls[0] == L'\0')
+        {
+            *p++ = 0xFFFF; *p++ = 0x0082;
+        }
+        else
+        {
+            while ((*p++ = static_cast<WORD>(*cls++)) != 0) {}
+        }
+        if (text)
+        {
+            while ((*p++ = static_cast<WORD>(*text++)) != 0) {}
+        }
         else *p++ = 0;
         *p++ = 0;
     };
-    addControl(WS_CHILD | WS_VISIBLE, 10, 10, 235, 14, 1000, L"STATIC", prompt);
-    addControl(WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, 10, 28, 235, 18, 1001, L"EDIT", value.c_str());
-    addControl(WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 105, 58, 62, 20, IDOK, L"BUTTON", L"OK");
-    addControl(WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 175, 58, 70, 20, IDCANCEL, L"BUTTON", L"Cancelar");
 
-    TextPromptState state{value, false};
-    const INT_PTR result = DialogBoxIndirectParamW(GetModuleHandleW(nullptr), dlg, owner, textPromptProc, reinterpret_cast<LPARAM>(&state));
+    addControl(WS_CHILD | WS_VISIBLE, 12, 10, 226, 14, 1000, L"STATIC", prompt);
+    addControl(WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP,
+               12, 28, 226, 18, 1001, L"EDIT", value.c_str());
+    addControl(WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+               132, 58, 50, 20, IDOK, L"BUTTON", L"OK");
+    addControl(WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+               188, 58, 50, 20, IDCANCEL, L"BUTTON", L"Cancelar");
+
+    TextPromptState state{value, npp, font, titleFont, nullptr, 0, 0, 0, false, screenPoint};
+    const INT_PTR result = DialogBoxIndirectParamW(GetModuleHandleW(nullptr), dlg, owner,
+                                                   textPromptProc, reinterpret_cast<LPARAM>(&state));
     if (result == IDOK && state.accepted)
     {
         value = state.value;
@@ -365,6 +493,10 @@ void QuickOpen::initialize(HWND nppHandle)
 
 void QuickOpen::destroy()
 {
+    _searchIndexGeneration.fetch_add(1);
+    _searchQueryGeneration.fetch_add(1);
+    if (_searchIndexThread.joinable()) _searchIndexThread.join();
+    if (_searchQueryThread.joinable()) _searchQueryThread.join();
     if (_syncTimer && _window)
     {
         KillTimer(_window, _syncTimer);
@@ -401,9 +533,11 @@ void QuickOpen::destroy()
     if (_font) DeleteObject(_font);
     if (_titleFont) DeleteObject(_titleFont);
     if (_symbolFont) DeleteObject(_symbolFont);
+    if (_backgroundBrush) DeleteObject(_backgroundBrush);
     _font = nullptr;
     _titleFont = nullptr;
     _symbolFont = nullptr;
+    _backgroundBrush = nullptr;
     g_instance = nullptr;
 }
 
@@ -424,14 +558,15 @@ void QuickOpen::createWindow()
     wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
     RegisterClassExW(&wc);
 
-    // Match the compact Win32 font metrics used by Notepad++ dialogs instead
-    // of the oversized font that made the previous panel look cramped.
-    _font = CreateFontW(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                        CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-    _titleFont = CreateFontW(-13, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                             CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+    // Use the Windows UI font that Notepad++ itself follows instead of a
+    // plugin-specific font. This keeps the panel consistent with the host.
+    NONCLIENTMETRICSW ncm{sizeof(ncm)};
+    SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
+    const LOGFONTW& lf = ncm.lfMessageFont;
+    _font = CreateFontIndirectW(&lf);
+    LOGFONTW titleLf = lf;
+    titleLf.lfWeight = FW_SEMIBOLD;
+    _titleFont = CreateFontIndirectW(&titleLf);
     _symbolFont = CreateFontW(-16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                               DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                               CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe MDL2 Assets");
@@ -753,7 +888,11 @@ void QuickOpen::createControls()
 
     _search = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_NOHIDESEL,
-        18, 24, 400, 26, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_SEARCH)),
+        18, 24, 332, 26, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_SEARCH)),
+        GetModuleHandleW(nullptr), nullptr);
+    _searchScopeButton = CreateWindowExW(0, L"BUTTON", L"Escopo",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        354, 24, 64, 26, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_SEARCH_SCOPE)),
         GetModuleHandleW(nullptr), nullptr);
 
     _workspaceGroup = CreateWindowExW(0, L"BUTTON", L"Workspace",
@@ -810,7 +949,7 @@ void QuickOpen::createControls()
         10, 632, 410, 22, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_STATUS)),
         GetModuleHandleW(nullptr), nullptr);
 
-    for (HWND h : {_searchGroup, _workspaceGroup, _search, _tree, _results,
+    for (HWND h : {_searchGroup, _workspaceGroup, _search, _searchScopeButton, _tree, _results,
                    _addFolder, _newWorkspace, _saveWorkspace, _openWorkspace, _removeFolder,
                    _expandAll, _collapseAll, _createContainer, _status})
         SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(_font), TRUE);
@@ -862,6 +1001,7 @@ void QuickOpen::createTooltips()
     addButtonTooltip(_expandAll, L"Expandir todas as pastas");
     addButtonTooltip(_collapseAll, L"Retrair todas as pastas");
     addButtonTooltip(_createContainer, L"Criar contêiner de projeto");
+    addButtonTooltip(_searchScopeButton, L"Escolher contêineres e pastas incluídos na pesquisa");
 }
 
 void QuickOpen::addButtonTooltip(HWND button, const wchar_t* text)
@@ -954,7 +1094,8 @@ void QuickOpen::layoutControls(int width, int height)
     const int contentH = (std::max)(60, height - contentY - statusH - 6);
 
     MoveWindow(_searchGroup, pad, 4, width - 2 * pad, searchGroupH, TRUE);
-    MoveWindow(_search, pad + 10, 24, width - 2 * pad - 20, 26, TRUE);
+    MoveWindow(_search, pad + 10, 24, (std::max)(120, width - 2 * pad - 88), 26, TRUE);
+    MoveWindow(_searchScopeButton, width - pad - 74, 24, 64, 26, TRUE);
     MoveWindow(_workspaceGroup, pad, workspaceGroupY, width - 2 * pad, workspaceGroupH, TRUE);
 
     constexpr int buttonSize = 32;
@@ -1029,9 +1170,14 @@ void QuickOpen::createSearchPopup()
 
     _searchPopupEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_NOHIDESEL,
-        12, 38, 720, 30, _searchPopup, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_POPUP_SEARCH)),
+        12, 38, 650, 30, _searchPopup, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_POPUP_SEARCH)),
+        GetModuleHandleW(nullptr), nullptr);
+    _searchPopupScopeButton = CreateWindowExW(0, L"BUTTON", L"Escopo",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        670, 38, 78, 30, _searchPopup, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_SEARCH_SCOPE)),
         GetModuleHandleW(nullptr), nullptr);
     SendMessageW(_searchPopupEdit, WM_SETFONT, reinterpret_cast<WPARAM>(_font), TRUE);
+    SendMessageW(_searchPopupScopeButton, WM_SETFONT, reinterpret_cast<WPARAM>(_font), TRUE);
     SendMessageW(_searchPopupEdit, EM_SETCUEBANNER, TRUE,
                  reinterpret_cast<LPARAM>(L"Nome do arquivo/pasta ou >texto para pesquisar dentro dos arquivos..."));
 
@@ -1073,7 +1219,8 @@ void QuickOpen::layoutSearchPopup()
     GetClientRect(_searchPopup, &rc);
     const int w = (std::max)(420, static_cast<int>(rc.right - rc.left));
     const int h = (std::max)(250, static_cast<int>(rc.bottom - rc.top));
-    MoveWindow(_searchPopupEdit, 12, 38, w - 24, 30, TRUE);
+    MoveWindow(_searchPopupEdit, 12, 38, w - 110, 30, TRUE);
+    MoveWindow(_searchPopupScopeButton, w - 90, 38, 78, 30, TRUE);
     MoveWindow(_searchPopupResults, 12, 78, w - 24, h - 118, TRUE);
 }
 
@@ -1084,6 +1231,7 @@ void QuickOpen::showSearchPopup()
     // Every Ctrl+P invocation starts a fresh search.
     if (_searchPopupEdit) SetWindowTextW(_searchPopupEdit, L"");
     if (_searchPopupResults) ListView_DeleteAllItems(_searchPopupResults);
+    _searchIndexValid = false;
     _searchResults.clear();
     layoutSearchPopup();
     RECT npp{};
@@ -1117,36 +1265,169 @@ void QuickOpen::updatePopupSearch()
     showPopupSearchResults(query);
 }
 
+
+void QuickOpen::startContentSearch(const std::wstring& query, bool popup)
+{
+    if (!_searchIndexSnapshot || query.size() < 2) return;
+
+    // Never join a running search on the UI thread. The previous implementation
+    // could block Notepad++ here for the entire duration of a workspace scan.
+    if (_searchQueryRunning)
+    {
+        // Cancel the current scan as soon as possible. The worker checks this
+        // generation between files; the UI thread never waits for it.
+        _pendingContentQuery = query;
+        _pendingContentPopup = popup;
+        _searchQueryGeneration.fetch_add(1);
+        return;
+    }
+    if (_searchQueryThread.joinable())
+        _searchQueryThread.join();
+
+    _searchQueryRunning = true;
+    const unsigned int generation = _searchQueryGeneration.fetch_add(1) + 1;
+    _runningContentQuery = query;
+    _runningContentPopup = popup;
+    const auto snapshot = _searchIndexSnapshot;
+    const auto disabled = _searchDisabledPaths;
+    const HWND target = _window;
+
+    _searchQueryThread = std::thread([this, query, popup, generation, snapshot, disabled, target]()
+    {
+        auto* found = new std::vector<SearchResult>();
+        found->reserve(MAX_SEARCH_RESULTS);
+
+        auto enabled = [&](const std::filesystem::path& path)
+        {
+            if (disabled.empty()) return true;
+            std::error_code ec;
+            for (const auto& dstr : disabled)
+            {
+                const std::filesystem::path d(dstr);
+                auto rel = std::filesystem::relative(path, d, ec);
+                if (!ec && rel != L".." && rel.native().rfind(L"..\\", 0) != 0 && rel.native().rfind(L"../", 0) != 0)
+                    return false;
+                ec.clear();
+            }
+            return true;
+        };
+
+        const std::wstring needle = query.substr(1);
+        for (const auto& item : *snapshot)
+        {
+            if (_searchQueryGeneration.load() != generation)
+                break;
+            if (!enabled(item.path)) continue;
+            if (fileContainsText(item.path, needle))
+            {
+                found->push_back(item);
+                if (found->size() >= MAX_SEARCH_RESULTS) break;
+            }
+        }
+
+        _searchQueryRunning = false;
+        if (!target)
+        {
+            delete found;
+            return;
+        }
+        if (_searchQueryGeneration.load() != generation)
+        {
+            delete found;
+            PostMessageW(target, WM_SEARCH_INDEX_READY + 1, popup ? 1 : 0, 0);
+            return;
+        }
+        PostMessageW(target, WM_SEARCH_INDEX_READY + 1, popup ? 1 : 0,
+                     reinterpret_cast<LPARAM>(found));
+    });
+}
+
+void QuickOpen::finishContentSearch(std::vector<SearchResult>* found, bool popup)
+{
+    if (!found)
+    {
+        HWND edit = popup ? _searchPopupEdit : _search;
+        const std::wstring current = edit ? getWindowText(edit) : L"";
+        if (!current.empty() && current.front() == L'>')
+            startContentSearch(current, popup);
+        return;
+    }
+    std::unique_ptr<std::vector<SearchResult>> holder(found);
+    _searchResults = std::move(*holder);
+    ListView_DeleteAllItems(popup ? _searchPopupResults : _results);
+    HWND list = popup ? _searchPopupResults : _results;
+    if (!list) return;
+    for (size_t i = 0; i < _searchResults.size(); ++i)
+    {
+        LVITEMW item{}; item.mask = LVIF_TEXT; item.iItem = static_cast<int>(i);
+        item.pszText = const_cast<LPWSTR>(_searchResults[i].fileName.c_str());
+        ListView_InsertItem(list, &item);
+        ListView_SetItemText(list, static_cast<int>(i), 1, const_cast<LPWSTR>(_searchResults[i].folder.c_str()));
+        const std::wstring fullPath = _searchResults[i].path.wstring();
+        ListView_SetItemText(list, static_cast<int>(i), 2, const_cast<LPWSTR>(fullPath.c_str()));
+    }
+    if (!popup)
+    {
+        _searchOnly = true;
+        ShowWindow(_tree, SW_HIDE); ShowWindow(_results, SW_SHOW);
+        SetWindowTextW(_status, (std::to_wstring(_searchResults.size()) + L" resultado(s)  •  Enter abrir  •  Esc limpar pesquisa").c_str());
+    }
+    if (!_searchResults.empty()) ListView_SetItemState(list, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+
+    HWND edit = popup ? _searchPopupEdit : _search;
+    const std::wstring current = getWindowText(edit);
+    if (!current.empty() && current.front() == L'>' && current != _runningContentQuery)
+        startContentSearch(current, popup);
+}
+
 void QuickOpen::showPopupSearchResults(const std::wstring& query)
 {
-    std::vector<SearchResult> found;
-    for (const auto& root : getWorkspaceRootsForPanel())
+    if (!_searchIndexValid)
     {
-        if (found.size() >= MAX_SEARCH_RESULTS) break;
-        searchDirectory(root, query, found, MAX_SEARCH_RESULTS);
+        if (!_searchIndexBuilding) startSearchIndexBuild();
+        SetWindowTextW(_status, L"Indexando arquivos... aguarde");
+        return;
     }
-    std::sort(found.begin(), found.end(), [&](const SearchResult& a, const SearchResult& b)
+
+    if (!query.empty() && query.front() == L'>')
     {
-        if (!query.empty() && query.front() == L'>')
+        startContentSearch(query, true);
+        return;
+    }
+
+    const std::wstring q = lower(query);
+    std::vector<std::pair<int, size_t>> ranked;
+    ranked.reserve(MAX_SEARCH_RESULTS * 4);
+    for (size_t i = 0; i < _searchIndex.size(); ++i)
+    {
+        const auto& item = _searchIndex[i];
+        if (!isSearchPathEnabled(item.path)) continue;
+        const int fileScore = fuzzyScoreLower(q, item.fileNameLower);
+        const int pathScore = fuzzyScoreLower(q, item.relativeLower);
+        const int score = (std::max)(fileScore, pathScore);
+        if (score >= 0)
         {
-            const std::wstring af = lower(a.folder + L"\\" + a.fileName);
-            const std::wstring bf = lower(b.folder + L"\\" + b.fileName);
-            return af < bf;
+            ranked.emplace_back(score, i);
+            if (ranked.size() >= static_cast<size_t>(MAX_SEARCH_RESULTS * 4)) break;
         }
-        const int as = (std::max)(fuzzyScore(query, a.path.filename().wstring()), fuzzyScore(query, a.relative));
-        const int bs = (std::max)(fuzzyScore(query, b.path.filename().wstring()), fuzzyScore(query, b.relative));
-        if (as != bs) return as > bs;
-        const std::wstring af = lower(a.folder + L"\\" + a.fileName);
-        const std::wstring bf = lower(b.folder + L"\\" + b.fileName);
-        return af < bf;
-    });
-    _searchResults = found;
+    }
+
+    const size_t wanted = (std::min)(ranked.size(), static_cast<size_t>(MAX_SEARCH_RESULTS));
+    std::partial_sort(ranked.begin(), ranked.begin() + wanted, ranked.end(),
+        [](const auto& a, const auto& b) {
+            if (a.first != b.first) return a.first > b.first;
+            return a.second < b.second;
+        });
+
+    _searchResults.clear();
+    _searchResults.reserve(wanted);
+    for (size_t i = 0; i < wanted; ++i)
+        _searchResults.push_back(_searchIndex[ranked[i].second]);
+
     ListView_DeleteAllItems(_searchPopupResults);
     for (size_t i = 0; i < _searchResults.size(); ++i)
     {
-        LVITEMW item{};
-        item.mask = LVIF_TEXT;
-        item.iItem = static_cast<int>(i);
+        LVITEMW item{}; item.mask = LVIF_TEXT; item.iItem = static_cast<int>(i);
         item.pszText = const_cast<LPWSTR>(_searchResults[i].fileName.c_str());
         ListView_InsertItem(_searchPopupResults, &item);
         ListView_SetItemText(_searchPopupResults, static_cast<int>(i), 1,
@@ -1156,7 +1437,8 @@ void QuickOpen::showPopupSearchResults(const std::wstring& query)
                              const_cast<LPWSTR>(fullPath.c_str()));
     }
     if (!_searchResults.empty())
-        ListView_SetItemState(_searchPopupResults, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+        ListView_SetItemState(_searchPopupResults, 0, LVIS_SELECTED | LVIS_FOCUSED,
+                              LVIS_SELECTED | LVIS_FOCUSED);
 }
 
 void QuickOpen::openPopupSearchResult()
@@ -1188,6 +1470,7 @@ void QuickOpen::clearTreeData()
 
 void QuickOpen::rebuildWorkspaceTree(bool /*preserveExpansion*/)
 {
+    invalidateSearchIndex();
     if (!_tree) return;
     clearTreeData();
     TreeView_DeleteAllItems(_tree);
@@ -1512,7 +1795,7 @@ void QuickOpen::showTreeContextMenu(HTREEITEM item, POINT screenPoint)
                                         screenPoint.x, screenPoint.y, 0, _window, nullptr);
     DestroyMenu(menu);
 
-    if (command == ID_CREATE_CONTAINER) { createContainer(); return; }
+    if (command == ID_CREATE_CONTAINER) { createContainer(screenPoint); return; }
     if (command == ID_ADD && isContainer) { addFolder(); return; }
     if (command == ID_REMOVE && (isContainer || isRoot)) { removeSelectedRoot(); return; }
     if (command == ID_CREATE_CONTAINER + 1 && isContainer) { renameContainer(it->second.containerIndex); return; }
@@ -1708,6 +1991,236 @@ int QuickOpen::fuzzyScore(const std::wstring& query, const std::wstring& candida
     return std::max(0, std::min(1000000, score));
 }
 
+
+int QuickOpen::fuzzyScoreLower(const std::wstring& q, const std::wstring& c)
+{
+    if (q.empty()) return 1;
+    size_t pos = 0;
+    int score = 0;
+    int last = -1;
+    for (wchar_t ch : q)
+    {
+        const size_t found = c.find(ch, pos);
+        if (found == std::wstring::npos) return -1;
+        score += 100;
+        if (last >= 0)
+            score += (static_cast<int>(found) == last + 1) ? 50 : -(std::min)(30, static_cast<int>(found) - last);
+        if (found == 0 || c[found - 1] == L'\\' || c[found - 1] == L'/' ||
+            c[found - 1] == L'_' || c[found - 1] == L'-')
+            score += 40;
+        last = static_cast<int>(found);
+        pos = found + 1;
+    }
+    score -= static_cast<int>(c.size() - q.size());
+    return (std::max)(0, (std::min)(1000000, score));
+}
+
+
+bool QuickOpen::isSearchPathEnabled(const std::filesystem::path& path) const
+{
+    if (_searchDisabledPaths.empty()) return true;
+
+    std::wstring value = lower(path.wstring());
+    std::replace(value.begin(), value.end(), L'/', L'\\');
+    if (!value.empty() && value.back() != L'\\') value.push_back(L'\\');
+
+    for (const auto& disabled : _searchDisabledPaths)
+    {
+        std::wstring prefix = lower(disabled);
+        std::replace(prefix.begin(), prefix.end(), L'/', L'\\');
+        if (!prefix.empty() && prefix.back() != L'\\') prefix.push_back(L'\\');
+        if (value.size() >= prefix.size() &&
+            value.compare(0, prefix.size(), prefix) == 0)
+            return false;
+    }
+    return true;
+}
+
+void QuickOpen::invalidateSearchIndex()
+{
+    _searchIndexValid = false;
+    _searchIndex.clear();
+    _searchIndexSnapshot.reset();
+    _searchIndexGeneration.fetch_add(1);
+    _searchQueryGeneration.fetch_add(1);
+}
+
+void QuickOpen::startSearchIndexBuild()
+{
+    if (_searchIndexBuilding || !_window) return;
+    if (_searchIndexThread.joinable()) _searchIndexThread.join();
+
+    const unsigned int generation = _searchIndexGeneration.load();
+    const auto roots = getWorkspaceRootsForPanel();
+    _searchIndexBuilding = true;
+    _searchIndexValid = false;
+
+    _searchIndexThread = std::thread([this, roots, generation]()
+    {
+        auto* built = new std::vector<SearchResult>();
+        constexpr size_t MAX_INDEX_FILES_PER_ROOT = 50000;
+        for (const auto& root : roots)
+        {
+            if (_searchIndexGeneration.load() != generation) break;
+            std::error_code ec;
+            std::filesystem::recursive_directory_iterator it(
+                root, std::filesystem::directory_options::skip_permission_denied, ec);
+            size_t visited = 0;
+            for (; it != std::filesystem::recursive_directory_iterator{} && !ec; it.increment(ec))
+            {
+                if (_searchIndexGeneration.load() != generation) break;
+                if (++visited > MAX_INDEX_FILES_PER_ROOT) break;
+                const auto p = it->path();
+                std::error_code itemEc;
+                if (it->is_directory(itemEc))
+                {
+                    if (isHiddenSystemDirectory(p)) it.disable_recursion_pending();
+                    continue;
+                }
+                if (!it->is_regular_file(itemEc)) continue;
+
+                std::wstring file = p.filename().wstring();
+                if (file.empty()) continue;
+                std::error_code relEc;
+                auto rel = std::filesystem::relative(p, root, relEc);
+                if (relEc || rel.empty()) rel = p.filename();
+                auto folderPath = rel.parent_path();
+                std::wstring folder = folderPath.empty() ? L"\\" : L"\\" + folderPath.wstring();
+                std::replace(folder.begin(), folder.end(), L'/', L'\\');
+                {
+                    const std::wstring relative = rel.wstring();
+                    built->push_back({p, file, folder, relative, lower(file), lower(relative)});
+                }
+            }
+        }
+
+        if (_searchIndexGeneration.load() != generation || !_window)
+        {
+            delete built;
+            _searchIndexBuilding = false;
+            return;
+        }
+        PostMessageW(_window, WM_SEARCH_INDEX_READY, static_cast<WPARAM>(generation), reinterpret_cast<LPARAM>(built));
+    });
+}
+
+void QuickOpen::finishSearchIndexBuild(std::vector<SearchResult>* built)
+{
+    std::unique_ptr<std::vector<SearchResult>> holder(built);
+    _searchIndexBuilding = false;
+    if (!holder) return;
+    _searchIndex = std::move(*holder);
+    _searchIndexSnapshot = std::make_shared<const std::vector<SearchResult>>(_searchIndex);
+    _searchIndexValid = true;
+    if (_searchOnly) updateSearch();
+    if (_searchPopup && IsWindowVisible(_searchPopup)) updatePopupSearch();
+}
+
+void QuickOpen::showSearchScopeMenu(HWND owner, POINT screenPoint)
+{
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    _scopeMenuFolders.clear();
+    _scopeMenuContainers.clear();
+    _nextScopeMenuId = 50000;
+
+    AppendMenuW(menu, MF_STRING | (_searchDisabledPaths.empty() ? MF_CHECKED : 0), 49999, L"Pesquisar em tudo");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+
+    auto addFolderItem = [&](const std::filesystem::path& folder, const std::wstring& label)
+    {
+        if (_nextScopeMenuId >= 59900) return;
+        const UINT id = _nextScopeMenuId++;
+        _scopeMenuFolders[id] = folder;
+        const bool disabled = _searchDisabledPaths.find(folder.wstring()) != _searchDisabledPaths.end();
+        AppendMenuW(menu, MF_STRING | (disabled ? MF_UNCHECKED : MF_CHECKED), id, label.c_str());
+    };
+
+    for (size_t i = 0; i < _containers.size(); ++i)
+    {
+        const auto& c = _containers[i];
+        HMENU sub = CreatePopupMenu();
+        if (!sub) continue;
+        size_t enabledCount = 0;
+        for (const auto& folder : c.folders)
+        {
+            if (_searchDisabledPaths.find(folder.wstring()) == _searchDisabledPaths.end()) ++enabledCount;
+            addFolderItem(folder, folder.filename().wstring().empty() ? folder.wstring() : folder.filename().wstring());
+            // Move the last generated item from the main menu into this submenu.
+            const UINT id = _nextScopeMenuId - 1;
+            MENUITEMINFOW mi{sizeof(mi)};
+            mi.fMask = MIIM_ID | MIIM_STATE | MIIM_STRING;
+            wchar_t text[1024]{};
+            GetMenuStringW(menu, id, text, static_cast<int>(std::size(text)), MF_BYCOMMAND);
+            mi.wID = id;
+            mi.fState = (_searchDisabledPaths.find(folder.wstring()) == _searchDisabledPaths.end()) ? MFS_CHECKED : MFS_UNCHECKED;
+            mi.dwTypeData = text;
+            DeleteMenu(menu, id, MF_BYCOMMAND);
+            InsertMenuItemW(sub, 0xFFFFFFFF, TRUE, &mi);
+        }
+        const UINT cid = _nextScopeMenuId++;
+        _scopeMenuContainers[cid] = i;
+        const bool allEnabled = !c.folders.empty() && enabledCount == c.folders.size();
+        InsertMenuW(sub, 0, MF_BYPOSITION | MF_STRING | (allEnabled ? MF_CHECKED : MF_UNCHECKED), cid, L"Pesquisar neste contêiner");
+        InsertMenuW(sub, 1, MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(sub), c.name.c_str());
+    }
+
+    for (const auto& root : _savedRoots)
+        addFolderItem(root, root.filename().wstring().empty() ? root.wstring() : root.filename().wstring());
+
+    // The menu above needs command handling by the owner window. Track the
+    // menu while it is open and dispatch the selected id through WM_COMMAND.
+    const int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screenPoint.x, screenPoint.y, 0, owner, nullptr);
+    if (cmd == 49999)
+    {
+        _searchDisabledPaths.clear();
+        _searchQueryGeneration.fetch_add(1);
+        writeWorkspaceFile();
+        if (_searchOnly) updateSearch();
+        if (_searchPopup && IsWindowVisible(_searchPopup)) updatePopupSearch();
+    }
+    else if (cmd >= 50000 && cmd < 60000)
+    {
+        applySearchScopeCommand(static_cast<UINT>(cmd));
+    }
+    DestroyMenu(menu);
+    _scopeMenuFolders.clear();
+    _scopeMenuContainers.clear();
+}
+
+void QuickOpen::applySearchScopeCommand(UINT id)
+{
+    if (id == 49999) { _searchDisabledPaths.clear(); }
+    else if (auto it = _scopeMenuFolders.find(id); it != _scopeMenuFolders.end())
+    {
+        const std::wstring key = it->second.wstring();
+        if (!_searchDisabledPaths.insert(key).second) _searchDisabledPaths.erase(key);
+    }
+    else if (auto it = _scopeMenuContainers.find(id); it != _scopeMenuContainers.end())
+    {
+        if (it->second < _containers.size())
+        {
+            const auto& c = _containers[it->second];
+            bool allDisabled = !c.folders.empty();
+            for (const auto& folder : c.folders)
+                if (_searchDisabledPaths.find(folder.wstring()) == _searchDisabledPaths.end()) { allDisabled = false; break; }
+            for (const auto& folder : c.folders)
+            {
+                if (allDisabled) _searchDisabledPaths.erase(folder.wstring());
+                else _searchDisabledPaths.insert(folder.wstring());
+            }
+        }
+    }
+    // Changing scope only changes filtering; the file index itself remains
+    // valid. Rebuilding a large workspace index here made every checkbox
+    // click stall the UI and caused unnecessary disk traversal.
+    _searchQueryGeneration.fetch_add(1);
+    writeWorkspaceFile();
+    if (_searchOnly) updateSearch();
+    if (_searchPopup && IsWindowVisible(_searchPopup)) updatePopupSearch();
+}
+
 void QuickOpen::searchDirectory(const std::filesystem::path& root, const std::wstring& query,
                                 std::vector<SearchResult>& results, size_t limit) const
 {
@@ -1764,87 +2277,122 @@ bool QuickOpen::fileContainsText(const std::filesystem::path& file, const std::w
     if (query.size() < 2) return false;
 
     const std::wstring ext = lower(file.extension().wstring());
-    static const std::array<const wchar_t*, 24> textExts = {
+    static const std::array<const wchar_t*, 30> textExts = {
         L".txt", L".ini", L".cfg", L".conf", L".log", L".xml", L".json", L".csv",
-        L".cpp", L".h", L".hpp", L".c", L".cc", L".cxx", L".py", L".lua",
-        L".js", L".ts", L".css", L".html", L".htm", L".md", L".yaml", L".yml"
+        L".cpp", L".h", L".hpp", L".c", L".cc", L".cxx", L".ixx", L".inl",
+        L".py", L".lua", L".js", L".ts", L".tsx", L".css", L".html", L".htm",
+        L".md", L".yaml", L".yml", L".bat", L".cmd", L".rc"
     };
     bool allowed = false;
     for (const auto* e : textExts)
         if (ext == e) { allowed = true; break; }
     if (!allowed) return false;
 
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(file, ec);
+    if (ec || size == 0 || size > MAX_CONTENT_FILE_SIZE) return false;
+
     std::ifstream in(file, std::ios::binary);
     if (!in) return false;
-    in.seekg(0, std::ios::end);
-    const std::streamoff size = in.tellg();
-    // Searching huge files on every keystroke is intentionally avoided.
-    if (size <= 0 || size > 4 * 1024 * 1024) return false;
+
+    // Read only the prefix first. This avoids wasting time decoding binary files
+    // that happen to have a source-like extension.
+    std::array<unsigned char, 4096> probe{};
+    in.read(reinterpret_cast<char*>(probe.data()), static_cast<std::streamsize>(probe.size()));
+    const std::streamsize probeSize = in.gcount();
+    if (probeSize <= 0) return false;
+    size_t zeroCount = 0;
+    for (std::streamsize i = 0; i < probeSize; ++i)
+        if (probe[static_cast<size_t>(i)] == 0) ++zeroCount;
+    if (zeroCount > 8 && probe[0] != 0xFF) return false;
+    in.clear();
     in.seekg(0, std::ios::beg);
 
-    const std::wstring needle = lower(query);
-    if (needle.empty()) return false;
+    const std::string utf8Needle = utf8FromWide(query);
+    if (utf8Needle.empty()) return false;
 
-    // Read in chunks instead of loading the entire file and lower-casing it.
-    // Keep a small byte overlap so matches spanning two chunks are found.
-    constexpr size_t CHUNK = 64 * 1024;
-    constexpr size_t OVERLAP = 8 * 1024;
-    std::string carry;
-    carry.reserve(OVERLAP);
-    std::string buffer(CHUNK, '\0');
-    bool first = true;
+    auto asciiFold = [](unsigned char c) -> unsigned char
+    {
+        return (c >= 'A' && c <= 'Z') ? static_cast<unsigned char>(c + ('a' - 'A')) : c;
+    };
 
+    auto containsBytes = [&](const std::vector<unsigned char>& data,
+                             const std::string& needle,
+                             bool asciiInsensitive) -> bool
+    {
+        if (needle.empty() || data.size() < needle.size()) return false;
+        const size_t m = needle.size();
+        size_t skip[256];
+        for (size_t i = 0; i < 256; ++i) skip[i] = m;
+        for (size_t i = 0; i + 1 < m; ++i)
+        {
+            const unsigned char c = static_cast<unsigned char>(needle[i]);
+            skip[c] = m - 1 - i;
+            if (asciiInsensitive)
+                skip[asciiFold(c)] = m - 1 - i;
+        }
+        for (size_t pos = 0; pos + m <= data.size(); )
+        {
+            size_t j = m;
+            while (j > 0)
+            {
+                const unsigned char a = data[pos + j - 1];
+                const unsigned char b = static_cast<unsigned char>(needle[j - 1]);
+                if ((asciiInsensitive ? asciiFold(a) : a) != (asciiInsensitive ? asciiFold(b) : b))
+                    break;
+                --j;
+            }
+            if (j == 0) return true;
+            const unsigned char tail = data[pos + m - 1];
+            pos += skip[asciiInsensitive ? asciiFold(tail) : tail];
+        }
+        return false;
+    };
+
+    // UTF-8/ASCII is by far the common case. Search bytes directly with a
+    // Boyer-Moore-Horspool style skip table instead of decoding/lowercasing every
+    // megabyte of every file.
+    const bool asciiQuery = std::all_of(utf8Needle.begin(), utf8Needle.end(),
+        [](unsigned char c) { return c < 0x80; });
+    std::string byteNeedle = utf8Needle;
+    if (asciiQuery)
+        for (char& c : byteNeedle) c = static_cast<char>(asciiFold(static_cast<unsigned char>(c)));
+
+    std::vector<unsigned char> buffer(CONTENT_CHUNK_SIZE);
+    std::vector<unsigned char> carry;
+    carry.reserve(byteNeedle.size() > 1 ? byteNeedle.size() - 1 : 0);
+
+    bool firstChunk = true;
     while (in)
     {
-        in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        in.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
         const std::streamsize got = in.gcount();
         if (got <= 0) break;
 
-        std::string bytes;
-        bytes.reserve(carry.size() + static_cast<size_t>(got));
-        bytes.append(carry);
-        bytes.append(buffer.data(), static_cast<size_t>(got));
+        std::vector<unsigned char> data;
+        data.reserve(carry.size() + static_cast<size_t>(got));
+        data.insert(data.end(), carry.begin(), carry.end());
+        data.insert(data.end(), buffer.begin(), buffer.begin() + got);
 
-        std::wstring text;
-        if (first && bytes.size() >= 2 &&
-            static_cast<unsigned char>(bytes[0]) == 0xFF &&
-            static_cast<unsigned char>(bytes[1]) == 0xFE)
+        // UTF-8 / ANSI search. For non-ASCII queries this is exact byte matching;
+        // ASCII queries are case-insensitive without Unicode decoding overhead.
+        if (containsBytes(data, byteNeedle, asciiQuery)) return true;
+
+        // UTF-16LE files are common in Windows tooling. Search their native bytes
+        // as a second fast path.
+        if (firstChunk && data.size() >= 2 && data[0] == 0xFF && data[1] == 0xFE)
         {
-            const size_t chars = (bytes.size() - 2) / sizeof(wchar_t);
-            text.assign(reinterpret_cast<const wchar_t*>(bytes.data() + 2),
-                        reinterpret_cast<const wchar_t*>(bytes.data() + 2) + chars);
+            const std::string wideNeedle = std::string(reinterpret_cast<const char*>(query.data()),
+                                                       query.size() * sizeof(wchar_t));
+            if (containsBytes(data, wideNeedle, false)) return true;
         }
-        else if (first && bytes.size() >= 3 &&
-                 static_cast<unsigned char>(bytes[0]) == 0xEF &&
-                 static_cast<unsigned char>(bytes[1]) == 0xBB &&
-                 static_cast<unsigned char>(bytes[2]) == 0xBF)
-        {
-            text = wideFromUtf8(bytes.substr(3));
-        }
+
+        const size_t keep = (std::max)(size_t(1), byteNeedle.size() > 1 ? byteNeedle.size() - 1 : 1);
+        if (data.size() > keep)
+            carry.assign(data.end() - static_cast<std::ptrdiff_t>(keep), data.end());
         else
-        {
-            text = wideFromUtf8(bytes);
-            if (text.empty() && !bytes.empty())
-            {
-                const int n = MultiByteToWideChar(CP_ACP, 0, bytes.data(),
-                                                  static_cast<int>(bytes.size()), nullptr, 0);
-                if (n > 0)
-                {
-                    text.resize(static_cast<size_t>(n));
-                    MultiByteToWideChar(CP_ACP, 0, bytes.data(),
-                                        static_cast<int>(bytes.size()), text.data(), n);
-                }
-            }
-        }
-
-        if (!text.empty() && lower(text).find(needle) != std::wstring::npos)
-            return true;
-
-        first = false;
-        if (bytes.size() > OVERLAP)
-            carry.assign(bytes.data() + bytes.size() - OVERLAP, OVERLAP);
-        else
-            carry = bytes;
+            carry = std::move(data);
+        firstChunk = false;
     }
     return false;
 }
@@ -1877,53 +2425,74 @@ void QuickOpen::updateSearch()
 
 void QuickOpen::showSearchResults(const std::wstring& query)
 {
-    std::vector<SearchResult> found;
-    const auto roots = getWorkspaceRootsForPanel();
-    for (const auto& root : roots)
+    if (!_searchIndexValid)
     {
-        if (found.size() >= MAX_SEARCH_RESULTS) break;
-        searchDirectory(root, query, found, MAX_SEARCH_RESULTS);
+        if (!_searchIndexBuilding) startSearchIndexBuild();
+        _searchOnly = true;
+        ShowWindow(_tree, SW_HIDE);
+        ShowWindow(_results, SW_SHOW);
+        SetWindowTextW(_status, L"Indexando arquivos... aguarde");
+        return;
     }
 
-    std::sort(found.begin(), found.end(), [&](const SearchResult& a, const SearchResult& b)
+    if (!query.empty() && query.front() == L'>')
     {
-        if (!query.empty() && query.front() == L'>')
+        _searchOnly = true;
+        ShowWindow(_tree, SW_HIDE);
+        ShowWindow(_results, SW_SHOW);
+        startContentSearch(query, false);
+        SetWindowTextW(_status, _searchQueryRunning ? L"Pesquisando conteúdo..." : L"Preparando pesquisa de conteúdo...");
+        return;
+    }
+
+    const std::wstring q = lower(query);
+    std::vector<SearchResult> found;
+    found.reserve(MAX_SEARCH_RESULTS);
+    std::vector<std::pair<int, size_t>> ranked;
+    ranked.reserve(MAX_SEARCH_RESULTS * 2);
+
+    for (size_t i = 0; i < _searchIndex.size(); ++i)
+    {
+        const auto& item = _searchIndex[i];
+        if (!isSearchPathEnabled(item.path)) continue;
+
+        const int fileScore = fuzzyScoreLower(q, item.fileNameLower);
+        const int pathScore = fuzzyScoreLower(q, item.relativeLower);
+        const int score = (std::max)(fileScore, pathScore);
+        if (score >= 0)
         {
-            const std::wstring af = lower(a.folder + L"\\" + a.fileName);
-            const std::wstring bf = lower(b.folder + L"\\" + b.fileName);
-            return af < bf;
+            ranked.emplace_back(score, i);
         }
-        const int as = (std::max)(fuzzyScore(query, a.path.filename().wstring()), fuzzyScore(query, a.relative));
-        const int bs = (std::max)(fuzzyScore(query, b.path.filename().wstring()), fuzzyScore(query, b.relative));
-        if (as != bs) return as > bs;
-        const std::wstring af = lower(a.folder + L"\\" + a.fileName);
-        const std::wstring bf = lower(b.folder + L"\\" + b.fileName);
-        return af < bf;
-    });
+    }
+
+    std::partial_sort(ranked.begin(), ranked.end(), ranked.begin() +
+                      (std::min)(ranked.size(), static_cast<size_t>(MAX_SEARCH_RESULTS)),
+        [](const auto& a, const auto& b) {
+            if (a.first != b.first) return a.first > b.first;
+            return a.second < b.second;
+        });
+
+    const size_t count = (std::min)(ranked.size(), static_cast<size_t>(MAX_SEARCH_RESULTS));
+    found.reserve(count);
+    for (size_t i = 0; i < count; ++i)
+        found.push_back(_searchIndex[ranked[i].second]);
 
     _searchResults = std::move(found);
     ListView_DeleteAllItems(_results);
     for (size_t i = 0; i < _searchResults.size(); ++i)
     {
-        LVITEMW item{};
-        item.mask = LVIF_TEXT;
-        item.iItem = static_cast<int>(i);
+        LVITEMW item{}; item.mask = LVIF_TEXT; item.iItem = static_cast<int>(i);
         item.pszText = const_cast<LPWSTR>(_searchResults[i].fileName.c_str());
         ListView_InsertItem(_results, &item);
-        ListView_SetItemText(_results, static_cast<int>(i), 1,
-                             const_cast<LPWSTR>(_searchResults[i].folder.c_str()));
+        ListView_SetItemText(_results, static_cast<int>(i), 1, const_cast<LPWSTR>(_searchResults[i].folder.c_str()));
         const std::wstring fullPath = _searchResults[i].path.wstring();
-        ListView_SetItemText(_results, static_cast<int>(i), 2,
-                             const_cast<LPWSTR>(fullPath.c_str()));
+        ListView_SetItemText(_results, static_cast<int>(i), 2, const_cast<LPWSTR>(fullPath.c_str()));
     }
-
-    ShowWindow(_tree, SW_HIDE);
-    ShowWindow(_results, SW_SHOW);
+    _searchOnly = true;
+    ShowWindow(_tree, SW_HIDE); ShowWindow(_results, SW_SHOW);
     if (!_searchResults.empty())
         ListView_SetItemState(_results, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
-
-    std::wstring status = std::to_wstring(_searchResults.size()) + L" resultado(s)  •  Enter abrir  •  Esc limpar pesquisa";
-    SetWindowTextW(_status, status.c_str());
+    SetWindowTextW(_status, (std::to_wstring(_searchResults.size()) + L" resultado(s)  •  Enter abrir  •  Esc limpar pesquisa").c_str());
 }
 
 void QuickOpen::clearSearchResults()
@@ -1947,10 +2516,11 @@ void QuickOpen::openSearchResult()
     SendMessageW(_npp, NPPM_DOOPEN, 0, reinterpret_cast<LPARAM>(path.c_str()));
 }
 
-void QuickOpen::createContainer()
+void QuickOpen::createContainer(POINT screenPoint)
 {
+    if (screenPoint.x < 0 || screenPoint.y < 0) GetCursorPos(&screenPoint);
     std::wstring name = L"Novo Projeto";
-    if (!promptForText(_window, L"Criar contêiner", L"Nome do projeto:", name)) return;
+    if (!promptForText(_window, _npp, _font, _titleFont, L"Criar contêiner", L"Nome do projeto:", name, screenPoint)) return;
 
     // Keep names unique and deterministic.
     const std::wstring base = name;
@@ -1972,7 +2542,8 @@ void QuickOpen::renameContainer(size_t index)
 {
     if (index >= _containers.size()) return;
     std::wstring name = _containers[index].name;
-    if (!promptForText(_window, L"Renomear contêiner", L"Nome do projeto:", name)) return;
+    POINT renamePoint{}; GetCursorPos(&renamePoint);
+    if (!promptForText(_window, _npp, _font, _titleFont, L"Renomear contêiner", L"Nome do projeto:", name, renamePoint)) return;
     if (name.empty()) return;
 
     for (size_t i = 0; i < _containers.size(); ++i)
@@ -2204,6 +2775,15 @@ bool QuickOpen::writeWorkspaceFile()
         json << L"\n";
     }
     json << L"    ],\n";
+    json << L"    \"searchDisabled\": [\n";
+    size_t disabledWritten = 0;
+    for (const auto& disabled : _searchDisabledPaths)
+    {
+        json << L"      \"" << jsonEscape(disabled) << L"\"";
+        if (++disabledWritten < _searchDisabledPaths.size()) json << L',';
+        json << L"\n";
+    }
+    json << L"    ],\n";
     json << L"    \"shortcuts\": {\n";
     json << L"      \"toggleWorkspace\": \"" << jsonEscape(NPPWorkSpace_GetToggleShortcut()) << L"\",\n";
     json << L"      \"search\": \"" << jsonEscape(NPPWorkSpace_GetSearchShortcut()) << L"\"\n";
@@ -2270,6 +2850,8 @@ bool QuickOpen::loadWorkspaceFile(const std::wstring& filePath)
 
     std::vector<WorkspaceContainer> containers;
     loadContainersFromJson(json, containers);
+    std::vector<std::wstring> disabledSearch;
+    extractJsonStringArray(json, L"searchDisabled", disabledSearch);
 
     std::wstring toggleShortcut;
     std::wstring searchShortcut;
@@ -2290,6 +2872,8 @@ bool QuickOpen::loadWorkspaceFile(const std::wstring& filePath)
     // Only replace the current workspace after the file was parsed successfully.
     _savedRoots = std::move(loaded);
     _containers = std::move(containers);
+    _searchDisabledPaths.clear();
+    for (const auto& path : disabledSearch) if (!path.empty()) _searchDisabledPaths.insert(path);
     _workspaceFile = filePath;
     clearSearchResults();
     saveSettings();
@@ -2373,36 +2957,110 @@ void QuickOpen::saveSettings() const
 void QuickOpen::applyTheme()
 {
     if (!_npp || !_window) return;
+
     _darkMode = SendMessageW(_npp, NPPM_ISDARKMODEENABLED, 0, 0) != FALSE;
 
+    // NPPM_GETDARKMODECOLORS is the Notepad++ dark-mode palette API. It must
+    // not be used as the light-mode palette: on light mode older N++ builds
+    // can leave the returned structure with dark-theme values. In light mode
+    // the native Windows colors are the UI palette used by Notepad++.
     NppDarkMode::Colors colors{};
-    if (!SendMessageW(_npp, NPPM_GETDARKMODECOLORS, sizeof(colors), reinterpret_cast<LPARAM>(&colors)))
+    if (_darkMode &&
+        SendMessageW(_npp, NPPM_GETDARKMODECOLORS, sizeof(colors), reinterpret_cast<LPARAM>(&colors)))
     {
-        colors.background = _darkMode ? RGB(32, 32, 32) : RGB(245, 245, 245);
-        colors.pureBackground = _darkMode ? RGB(38, 38, 38) : RGB(255, 255, 255);
-        colors.text = _darkMode ? RGB(230, 230, 230) : RGB(30, 30, 30);
-        colors.edge = _darkMode ? RGB(90, 90, 90) : RGB(180, 180, 180);
+        // Keep the active N++ dark/custom-tone palette exactly as supplied.
+    }
+    else
+    {
+        colors.background = GetSysColor(COLOR_BTNFACE);
+        colors.softerBackground = GetSysColor(COLOR_BTNFACE);
+        colors.hotBackground = GetSysColor(COLOR_3DLIGHT);
+        colors.pureBackground = GetSysColor(COLOR_WINDOW);
+        colors.errorBackground = GetSysColor(COLOR_WINDOW);
+        colors.text = GetSysColor(COLOR_WINDOWTEXT);
+        colors.darkerText = GetSysColor(COLOR_WINDOWTEXT);
+        colors.disabledText = GetSysColor(COLOR_GRAYTEXT);
+        colors.linkText = GetSysColor(COLOR_HOTLIGHT);
+        colors.edge = GetSysColor(COLOR_BTNSHADOW);
+        colors.hotEdge = GetSysColor(COLOR_HIGHLIGHT);
+        colors.disabledEdge = GetSysColor(COLOR_3DLIGHT);
     }
 
-    TreeView_SetBkColor(_tree, colors.pureBackground);
-    TreeView_SetTextColor(_tree, colors.text);
-    ListView_SetBkColor(_results, colors.pureBackground);
-    ListView_SetTextBkColor(_results, colors.pureBackground);
-    ListView_SetTextColor(_results, colors.text);
+    _backgroundColor = colors.background;
+    _textColor = colors.text;
+    _edgeColor = colors.edge;
+    if (_backgroundBrush) DeleteObject(_backgroundBrush);
+    _backgroundBrush = CreateSolidBrush(_backgroundColor);
 
-    for (HWND h : {_searchGroup, _workspaceGroup, _search, _tree, _results,
+    const COLORREF contentBackground = colors.pureBackground;
+    if (_tree)
+    {
+        TreeView_SetBkColor(_tree, contentBackground);
+        TreeView_SetTextColor(_tree, colors.text);
+    }
+    if (_results)
+    {
+        ListView_SetBkColor(_results, contentBackground);
+        ListView_SetTextBkColor(_results, contentBackground);
+        ListView_SetTextColor(_results, colors.text);
+    }
+    if (_searchPopupResults)
+    {
+        ListView_SetBkColor(_searchPopupResults, contentBackground);
+        ListView_SetTextBkColor(_searchPopupResults, contentBackground);
+        ListView_SetTextColor(_searchPopupResults, colors.text);
+    }
+
+    // Initialize the whole panel through Notepad++ once, then refresh its
+    // children. The native API knows how to switch both directions (dark ->
+    // light and light -> dark) and keeps buttons/scrollbars consistent.
+    SendMessageW(_npp, NPPM_DARKMODESUBCLASSANDTHEME,
+                 static_cast<WPARAM>(NppDarkMode::dmfInit), reinterpret_cast<LPARAM>(_window));
+
+    for (HWND h : {_searchGroup, _workspaceGroup, _search, _searchScopeButton, _tree, _results,
                    _addFolder, _newWorkspace, _saveWorkspace, _openWorkspace, _removeFolder,
                    _expandAll, _collapseAll, _createContainer, _status})
     {
-        if (h) SendMessageW(_npp, NPPM_DARKMODESUBCLASSANDTHEME,
-                            static_cast<WPARAM>(NppDarkMode::dmfHandleChange), reinterpret_cast<LPARAM>(h));
+        if (!h) continue;
+        if (_darkMode)
+        {
+            SendMessageW(_npp, NPPM_DARKMODESUBCLASSANDTHEME,
+                         static_cast<WPARAM>(NppDarkMode::dmfHandleChange), reinterpret_cast<LPARAM>(h));
+        }
+        else
+        {
+            // Clear any stale dark-mode theme from controls when returning to
+            // light mode. Reapply the standard Windows theme metrics.
+            SetWindowTheme(h, L"Explorer", nullptr);
+        }
     }
+
     if (_searchPopup)
+    {
         SendMessageW(_npp, NPPM_DARKMODESUBCLASSANDTHEME,
-                     static_cast<WPARAM>(NppDarkMode::dmfHandleChange), reinterpret_cast<LPARAM>(_searchPopup));
+                     static_cast<WPARAM>(NppDarkMode::dmfInit), reinterpret_cast<LPARAM>(_searchPopup));
+        if (_searchPopupResults)
+        {
+            ListView_SetBkColor(_searchPopupResults, contentBackground);
+            ListView_SetTextBkColor(_searchPopupResults, contentBackground);
+            ListView_SetTextColor(_searchPopupResults, colors.text);
+        }
+        if (_darkMode)
+        {
+            for (HWND h : {_searchPopupEdit, _searchPopupScopeButton, _searchPopupResults})
+                if (h) SendMessageW(_npp, NPPM_DARKMODESUBCLASSANDTHEME,
+                                    static_cast<WPARAM>(NppDarkMode::dmfHandleChange), reinterpret_cast<LPARAM>(h));
+        }
+        else
+        {
+            for (HWND h : {_searchPopupEdit, _searchPopupScopeButton, _searchPopupResults})
+                if (h) SetWindowTheme(h, L"Explorer", nullptr);
+        }
+    }
 
     InvalidateRect(_window, nullptr, TRUE);
-    if (_searchPopup) InvalidateRect(_searchPopup, nullptr, TRUE);
+    UpdateWindow(_window);
+    if (_searchPopup) { InvalidateRect(_searchPopup, nullptr, TRUE); UpdateWindow(_searchPopup); }
 }
 
 void QuickOpen::onDarkModeChanged()
@@ -2434,6 +3092,23 @@ LRESULT CALLBACK QuickOpen::windowProc(HWND h, UINT msg, WPARAM w, LPARAM l)
 
 LRESULT QuickOpen::handleMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
 {
+    if (msg == WM_ERASEBKGND)
+    {
+        if (_backgroundBrush)
+        {
+            RECT rc{}; GetClientRect(h, &rc);
+            FillRect(reinterpret_cast<HDC>(w), &rc, _backgroundBrush);
+            return 1;
+        }
+    }
+    if (msg == WM_CTLCOLORSTATIC)
+    {
+        HDC dc = reinterpret_cast<HDC>(w);
+        SetTextColor(dc, _textColor);
+        SetBkColor(dc, _backgroundColor);
+        SetBkMode(dc, TRANSPARENT);
+        return reinterpret_cast<LRESULT>(_backgroundBrush);
+    }
     switch (msg)
     {
     case WM_GETMINMAXINFO:
@@ -2459,6 +3134,13 @@ LRESULT QuickOpen::handleMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
         return 0;
     }
 
+    case WM_SEARCH_INDEX_READY:
+        finishSearchIndexBuild(reinterpret_cast<std::vector<SearchResult>*>(l));
+        return 0;
+    case WM_SEARCH_INDEX_READY + 1:
+        finishContentSearch(reinterpret_cast<std::vector<SearchResult>*>(l), w != 0);
+        return 0;
+
     case WM_TIMER:
         if (w == WORKSPACE_SYNC_TIMER)
         {
@@ -2479,6 +3161,8 @@ LRESULT QuickOpen::handleMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
     {
         const int id = LOWORD(w);
         const int code = HIWORD(w);
+        if (id == ID_SEARCH_SCOPE && code == BN_CLICKED)
+        { POINT pt{}; GetCursorPos(&pt); showSearchScopeMenu(h, pt); return 0; }
         if (id == ID_SEARCH && code == EN_CHANGE)
         {
             scheduleSearch(false);
@@ -2496,7 +3180,8 @@ LRESULT QuickOpen::handleMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
         if (id == ID_REMOVE) { removeSelectedRoot(); return 0; }
         if (id == ID_EXPAND_ALL) { expandAllFolders(); return 0; }
         if (id == ID_COLLAPSE_ALL) { collapseAllFolders(); return 0; }
-        if (id == ID_CREATE_CONTAINER) { createContainer(); return 0; }
+        if (id == ID_CREATE_CONTAINER) { POINT pt{}; GetCursorPos(&pt); createContainer(pt); return 0; }
+        if (id >= 50000 && id < 60000) { applySearchScopeCommand(static_cast<UINT>(id)); return 0; }
         break;
     }
 
@@ -2639,7 +3324,7 @@ LRESULT QuickOpen::handleEditMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
         if (msg == WM_KEYDOWN)
         {
             if (w == VK_ESCAPE) { hideSearchPopup(); return 0; }
-            if (w == VK_RETURN) { openPopupSearchResult(); return 0; }
+            if (w == VK_RETURN) { openSelectedResults(_searchPopupResults, true); return 0; }
             if (w == VK_DOWN) { SetFocus(_searchPopupResults); return 0; }
         }
         return _oldPopupSearchProc ? CallWindowProcW(_oldPopupSearchProc, h, msg, w, l)
@@ -2716,6 +3401,12 @@ LRESULT QuickOpen::handleSearchPopupMessage(HWND h, UINT msg, WPARAM w, LPARAM l
 {
     switch (msg)
     {
+    case WM_SEARCH_INDEX_READY:
+        finishSearchIndexBuild(reinterpret_cast<std::vector<SearchResult>*>(l));
+        return 0;
+    case WM_SEARCH_INDEX_READY + 1:
+        finishContentSearch(reinterpret_cast<std::vector<SearchResult>*>(l), w != 0);
+        return 0;
     case WM_TIMER:
         if (w == SEARCH_DEBOUNCE_TIMER)
         {
@@ -2735,11 +3426,14 @@ LRESULT QuickOpen::handleSearchPopupMessage(HWND h, UINT msg, WPARAM w, LPARAM l
         }
         break;
     case WM_COMMAND:
+        if (LOWORD(w) == ID_SEARCH_SCOPE && HIWORD(w) == BN_CLICKED)
+        { POINT pt{}; GetCursorPos(&pt); showSearchScopeMenu(h, pt); return 0; }
         if (LOWORD(w) == ID_OPEN_SELECTED)
         {
             openSelectedResults(_searchPopupResults, true);
             return 0;
         }
+        if (LOWORD(w) >= 50000 && LOWORD(w) < 60000) { applySearchScopeCommand(static_cast<UINT>(LOWORD(w))); return 0; }
         if (LOWORD(w) == ID_POPUP_SEARCH && HIWORD(w) == EN_CHANGE)
         {
             scheduleSearch(true);

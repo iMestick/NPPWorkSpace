@@ -1,1 +1,28 @@
+# CMake build output
 build/
+
+# Visual Studio / MSBuild user files
+.vs/
+*.user
+*.suo
+*.vcxproj.user
+
+# Compiled binaries
+*.dll
+*.exe
+*.lib
+*.exp
+*.pdb
+*.obj
+*.ilk
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+
+# OS/editor files
+Thumbs.db
+.DS_Store
