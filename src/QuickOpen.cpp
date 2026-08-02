@@ -1401,7 +1401,26 @@ void QuickOpen::collapseAllFolders()
 
 void QuickOpen::handleTreeDoubleClick(LPNMTREEVIEWW tv)
 {
-    if (tv) openTreeSelection();
+    if (!tv) return;
+
+    // A double click is an explicit open action. If the clicked file is part
+    // of a multi-selection, open the whole selection; otherwise open it alone.
+    const HTREEITEM item = tv->itemNew.hItem;
+    auto it = _nodeData.find(item);
+    if (it == _nodeData.end()) return;
+
+    if (it->second.type == NodeType::File)
+    {
+        if (!isTreeFileSelected(item))
+        {
+            _selectedTreeFiles.clear();
+            _selectedTreeFiles.insert(item);
+        }
+        openSelectedTreeFiles();
+        return;
+    }
+
+    openTreeSelection();
 }
 
 void QuickOpen::handleTreeItemExpanding(LPNMTREEVIEWW tv)
@@ -2141,6 +2160,15 @@ LRESULT QuickOpen::handleMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
                         cd->clrText = GetSysColor(COLOR_HIGHLIGHTTEXT);
                     }
                     return CDRF_DODEFAULT;
+                }
+            }
+            if (hdr->code == TVN_KEYDOWN)
+            {
+                const auto* key = reinterpret_cast<const NMTVKEYDOWN*>(hdr);
+                if (key && key->wVKey == VK_RETURN)
+                {
+                    openTreeSelection();
+                    return 0;
                 }
             }
             if (hdr->code == TVN_ITEMEXPANDINGW) { handleTreeItemExpanding(const_cast<NMTREEVIEWW*>(tv)); return 0; }
