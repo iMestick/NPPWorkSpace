@@ -35,6 +35,7 @@ constexpr int ID_OPEN = 1014;
 constexpr int ID_REMOVE = 1007;
 constexpr int ID_EXPAND_ALL = 1012;
 constexpr int ID_COLLAPSE_ALL = 1013;
+constexpr int ID_CREATE_CONTAINER = 1016;
 constexpr int ID_OPEN_SELECTED = 1015;
 constexpr int ID_STATUS = 1009;
 constexpr int ID_SEARCH_GROUP = 1010;
@@ -212,6 +213,99 @@ bool chooseFolder(HWND owner, std::filesystem::path& result)
 
     result = std::filesystem::path(path);
     return true;
+}
+
+
+struct TextPromptState
+{
+    std::wstring value;
+    bool accepted{false};
+};
+
+INT_PTR CALLBACK textPromptProc(HWND dlg, UINT msg, WPARAM w, LPARAM l)
+{
+    auto* state = reinterpret_cast<TextPromptState*>(GetWindowLongPtrW(dlg, GWLP_USERDATA));
+    if (msg == WM_INITDIALOG)
+    {
+        state = reinterpret_cast<TextPromptState*>(l);
+        SetWindowLongPtrW(dlg, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+        SetDlgItemTextW(dlg, 1001, state->value.c_str());
+        SetFocus(GetDlgItem(dlg, 1001));
+        SendDlgItemMessageW(dlg, 1001, EM_SETSEL, 0, -1);
+        return FALSE;
+    }
+    if (!state) return FALSE;
+    if (msg == WM_COMMAND)
+    {
+        if (LOWORD(w) == IDOK)
+        {
+            wchar_t buffer[512]{};
+            GetDlgItemTextW(dlg, 1001, buffer, static_cast<int>(std::size(buffer)));
+            state->value = buffer;
+            state->accepted = !state->value.empty();
+            EndDialog(dlg, IDOK);
+            return TRUE;
+        }
+        if (LOWORD(w) == IDCANCEL)
+        {
+            state->accepted = false;
+            EndDialog(dlg, IDCANCEL);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+bool promptForText(HWND owner, const wchar_t* title, const wchar_t* prompt, std::wstring& value)
+{
+    struct DialogBuffer
+    {
+        DLGTEMPLATE dlg{};
+        WORD menu{0}, className{0};
+        wchar_t title[64]{};
+        WORD pointSize{9};
+        wchar_t font[32]{};
+    };
+    std::vector<BYTE> data(2048, 0);
+    auto* dlg = reinterpret_cast<DLGTEMPLATE*>(data.data());
+    dlg->style = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_SETFONT;
+    dlg->dwExtendedStyle = 0;
+    dlg->cdit = 4;
+    dlg->x = 0; dlg->y = 0; dlg->cx = 260; dlg->cy = 92;
+    WORD* p = reinterpret_cast<WORD*>(dlg + 1);
+    *p++ = 0; *p++ = 0;
+    const wchar_t* t = title;
+    while ((*p++ = static_cast<WORD>(*t++)) != 0) {}
+    *p++ = 9;
+    const wchar_t* font = L"Segoe UI";
+    while ((*p++ = static_cast<WORD>(*font++)) != 0) {}
+
+    auto alignDword = [&p]() { p = reinterpret_cast<WORD*>((reinterpret_cast<ULONG_PTR>(p) + 3) & ~static_cast<ULONG_PTR>(3)); };
+    auto addControl = [&](DWORD style, short x, short y, short cx, short cy, WORD id, LPCWSTR cls, LPCWSTR text)
+    {
+        alignDword();
+        auto* item = reinterpret_cast<DLGITEMTEMPLATE*>(p);
+        item->style = style; item->dwExtendedStyle = 0; item->x = x; item->y = y; item->cx = cx; item->cy = cy; item->id = id;
+        p = reinterpret_cast<WORD*>(item + 1);
+        if (cls[0] == L'\0') { *p++ = 0xFFFF; *p++ = 0x0082; }
+        else { while ((*p++ = static_cast<WORD>(*cls++)) != 0) {} }
+        if (text) { while ((*p++ = static_cast<WORD>(*text++)) != 0) {} }
+        else *p++ = 0;
+        *p++ = 0;
+    };
+    addControl(WS_CHILD | WS_VISIBLE, 10, 10, 235, 14, 1000, L"STATIC", prompt);
+    addControl(WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, 10, 28, 235, 18, 1001, L"EDIT", value.c_str());
+    addControl(WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 105, 58, 62, 20, IDOK, L"BUTTON", L"OK");
+    addControl(WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 175, 58, 70, 20, IDCANCEL, L"BUTTON", L"Cancelar");
+
+    TextPromptState state{value, false};
+    const INT_PTR result = DialogBoxIndirectParamW(GetModuleHandleW(nullptr), dlg, owner, textPromptProc, reinterpret_cast<LPARAM>(&state));
+    if (result == IDOK && state.accepted)
+    {
+        value = state.value;
+        return true;
+    }
+    return false;
 }
 
 BOOL CALLBACK enumTree(HWND hwnd, LPARAM lp)
@@ -695,6 +789,10 @@ void QuickOpen::createControls()
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER,
         234, 86, 32, 28, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_COLLAPSE_ALL)),
         GetModuleHandleW(nullptr), nullptr);
+    _createContainer = CreateWindowExW(0, L"BUTTON", L"\xE8B8",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER,
+        270, 86, 32, 28, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_CREATE_CONTAINER)),
+        GetModuleHandleW(nullptr), nullptr);
 
     _tree = CreateWindowExW(WS_EX_CLIENTEDGE, WC_TREEVIEWW, L"",
         WS_CHILD | WS_VISIBLE | TVS_HASBUTTONS | TVS_HASLINES | TVS_LINESATROOT |
@@ -714,11 +812,11 @@ void QuickOpen::createControls()
 
     for (HWND h : {_searchGroup, _workspaceGroup, _search, _tree, _results,
                    _addFolder, _newWorkspace, _saveWorkspace, _openWorkspace, _removeFolder,
-                   _expandAll, _collapseAll, _status})
+                   _expandAll, _collapseAll, _createContainer, _status})
         SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(_font), TRUE);
 
     for (HWND h : {_addFolder, _newWorkspace, _saveWorkspace, _openWorkspace, _removeFolder,
-                   _expandAll, _collapseAll})
+                   _expandAll, _collapseAll, _createContainer})
         SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(_symbolFont), TRUE);
 
     SendMessageW(_search, EM_SETCUEBANNER, TRUE,
@@ -763,6 +861,7 @@ void QuickOpen::createTooltips()
     addButtonTooltip(_removeFolder, L"Remover a pasta selecionada");
     addButtonTooltip(_expandAll, L"Expandir todas as pastas");
     addButtonTooltip(_collapseAll, L"Retrair todas as pastas");
+    addButtonTooltip(_createContainer, L"Criar contêiner de projeto");
 }
 
 void QuickOpen::addButtonTooltip(HWND button, const wchar_t* text)
@@ -807,7 +906,16 @@ void QuickOpen::syncNativeFolderWorkspace()
     bool changed = false;
     for (const auto& root : roots)
     {
-        if (std::find(_savedRoots.begin(), _savedRoots.end(), root) == _savedRoots.end())
+        bool alreadyInContainer = false;
+        for (const auto& container : _containers)
+        {
+            if (std::find(container.folders.begin(), container.folders.end(), root) != container.folders.end())
+            {
+                alreadyInContainer = true;
+                break;
+            }
+        }
+        if (!alreadyInContainer && std::find(_savedRoots.begin(), _savedRoots.end(), root) == _savedRoots.end())
         {
             _savedRoots.push_back(root);
             changed = true;
@@ -853,7 +961,7 @@ void QuickOpen::layoutControls(int width, int height)
     constexpr int gap = 5;
     const int buttonY = 82;
     int x = pad + 10;
-    HWND buttons[] = {_addFolder, _newWorkspace, _saveWorkspace, _openWorkspace, _removeFolder, _expandAll, _collapseAll};
+    HWND buttons[] = {_addFolder, _newWorkspace, _saveWorkspace, _openWorkspace, _removeFolder, _expandAll, _collapseAll, _createContainer};
     for (HWND button : buttons)
     {
         MoveWindow(button, x, buttonY, buttonSize, 30, TRUE);
@@ -1087,6 +1195,9 @@ void QuickOpen::rebuildWorkspaceTree(bool /*preserveExpansion*/)
     // NPPWorkSpace is the authoritative workspace. Roots discovered in
     // Notepad++'s legacy Folder as Workspace are imported into _savedRoots
     // and the native panel is kept hidden.
+    for (size_t i = 0; i < _containers.size(); ++i)
+        addContainerToTree(i);
+
     for (const auto& root : _savedRoots)
         addRootToTree(root, false);
 
@@ -1094,23 +1205,49 @@ void QuickOpen::rebuildWorkspaceTree(bool /*preserveExpansion*/)
     ShowWindow(_tree, SW_SHOW);
     ShowWindow(_results, SW_HIDE);
 
-    std::wstring status = L"NPPWorkSpace  •  " + std::to_wstring(_savedRoots.size()) + L" pasta(s)  •  Ctrl+B mostrar/ocultar  •  Ctrl+P pesquisar";
+    std::wstring status = L"NPPWorkSpace  •  " + std::to_wstring(_containers.size()) + L" projeto(s)  •  " + std::to_wstring(_savedRoots.size()) + L" pasta(s)  •  Ctrl+B mostrar/ocultar  •  Ctrl+P pesquisar";
     SetWindowTextW(_status, status.c_str());
 }
 
-void QuickOpen::addRootToTree(const std::filesystem::path& root, bool fromNppWorkspace)
+void QuickOpen::addContainerToTree(size_t containerIndex)
+{
+    if (containerIndex >= _containers.size()) return;
+    const auto& container = _containers[containerIndex];
+    addNode(_tree, TVI_ROOT, container.name, {}, NodeType::Container, false, !container.folders.empty(), containerIndex);
+    HTREEITEM item = nullptr;
+    // Locate the newly inserted container by walking the top-level nodes.
+    // container by walking the top-level nodes instead.
+    for (HTREEITEM current = TreeView_GetRoot(_tree); current; current = TreeView_GetNextSibling(_tree, current))
+    {
+        auto it = _nodeData.find(current);
+        if (it != _nodeData.end() && it->second.type == NodeType::Container && it->second.containerIndex == containerIndex)
+        {
+            item = current;
+            break;
+        }
+    }
+    if (!item || container.folders.empty()) return;
+    // Replace the lazy dummy with the actual folders so containers behave like
+    // regular expandable project folders.
+    HTREEITEM child = TreeView_GetChild(_tree, item);
+    if (child) TreeView_DeleteItem(_tree, child);
+    for (const auto& folder : container.folders)
+        addRootToTree(folder, false, item, containerIndex);
+}
+
+void QuickOpen::addRootToTree(const std::filesystem::path& root, bool fromNppWorkspace, HTREEITEM parent, size_t containerIndex)
 {
     if (root.empty()) return;
     std::error_code ec;
     if (!std::filesystem::is_directory(root, ec)) return;
 
     const std::wstring label = root.filename().wstring().empty() ? root.wstring() : root.filename().wstring();
-    addNode(_tree, TVI_ROOT, label, root, NodeType::Root, fromNppWorkspace, true);
+    addNode(_tree, parent, label, root, NodeType::Root, fromNppWorkspace, true, containerIndex);
 }
 
 void QuickOpen::addNode(HWND tree, HTREEITEM parent, const std::wstring& label,
                         const std::filesystem::path& path, NodeType type,
-                        bool fromNppWorkspace, bool hasChildren)
+                        bool fromNppWorkspace, bool hasChildren, size_t containerIndex)
 {
     TVINSERTSTRUCTW ins{};
     ins.hParent = parent;
@@ -1118,7 +1255,7 @@ void QuickOpen::addNode(HWND tree, HTREEITEM parent, const std::wstring& label,
     ins.item.mask = TVIF_TEXT | TVIF_PARAM;
     ins.item.pszText = const_cast<LPWSTR>(label.c_str());
 
-    auto* data = new NodeData{type, path, fromNppWorkspace};
+    auto* data = new NodeData{type, path, fromNppWorkspace, containerIndex};
     ins.item.lParam = reinterpret_cast<LPARAM>(data);
     HTREEITEM item = TreeView_InsertItem(tree, &ins);
     _nodeData[item] = *data;
@@ -1341,25 +1478,65 @@ void QuickOpen::openSelectedResults(HWND list, bool closePopup)
 void QuickOpen::showTreeContextMenu(HTREEITEM item, POINT screenPoint)
 {
     auto it = _nodeData.find(item);
-    if (it == _nodeData.end()) return;
-
+    const bool hasItem = it != _nodeData.end();
     const bool selectedFiles = !_selectedTreeFiles.empty();
-    const bool singleRoot = it->second.type == NodeType::Root && !it->second.fromNppWorkspace;
-    if (!selectedFiles && !singleRoot) return;
+    const bool isContainer = hasItem && it->second.type == NodeType::Container;
+    const bool isRoot = hasItem && it->second.type == NodeType::Root && !it->second.fromNppWorkspace;
 
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
 
     if (selectedFiles)
+    {
         AppendMenuW(menu, MF_STRING, ID_OPEN_SELECTED, L"Abrir arquivos selecionados");
-    if (selectedFiles && singleRoot)
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    if (singleRoot)
+    }
+
+    if (isContainer)
+    {
+        AppendMenuW(menu, MF_STRING, ID_ADD, L"Adicionar pasta ao projeto");
+        AppendMenuW(menu, MF_STRING, ID_REMOVE, L"Excluir contêiner");
+        AppendMenuW(menu, MF_STRING, ID_CREATE_CONTAINER + 1, L"Renomear contêiner");
+    }
+    else if (isRoot)
+    {
+        AppendMenuW(menu, MF_STRING, ID_CREATE_CONTAINER + 2, L"Mover pasta para contêiner");
         AppendMenuW(menu, MF_STRING, ID_REMOVE, L"Remover pasta do NPPWorkSpace");
+    }
+
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, ID_CREATE_CONTAINER, L"Criar contêiner");
 
     SetForegroundWindow(_window);
-    TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_LEFTALIGN, screenPoint.x, screenPoint.y, 0, _window, nullptr);
+    const UINT command = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_RETURNCMD,
+                                        screenPoint.x, screenPoint.y, 0, _window, nullptr);
     DestroyMenu(menu);
+
+    if (command == ID_CREATE_CONTAINER) { createContainer(); return; }
+    if (command == ID_ADD && isContainer) { addFolder(); return; }
+    if (command == ID_REMOVE && (isContainer || isRoot)) { removeSelectedRoot(); return; }
+    if (command == ID_CREATE_CONTAINER + 1 && isContainer) { renameContainer(it->second.containerIndex); return; }
+    if (command == ID_CREATE_CONTAINER + 2 && isRoot)
+    {
+        HMENU sub = CreatePopupMenu();
+        if (!sub) return;
+        for (size_t i = 0; i < _containers.size(); ++i)
+            AppendMenuW(sub, MF_STRING, 3000 + static_cast<UINT>(i), _containers[i].name.c_str());
+        if (!_containers.empty())
+        {
+            const UINT selectedCommand = TrackPopupMenu(sub, TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_RETURNCMD,
+                                                        screenPoint.x + 8, screenPoint.y + 8, 0, _window, nullptr);
+            if (selectedCommand >= 3000 && selectedCommand < 3000 + _containers.size())
+                moveFolderToContainer(it->second.path, selectedCommand - 3000);
+        }
+        else
+        {
+            MessageBoxW(_window, L"Crie um contêiner primeiro para organizar esta pasta.", L"NPPWorkSpace", MB_ICONINFORMATION);
+        }
+        DestroyMenu(sub);
+        return;
+    }
+    if (command == ID_OPEN_SELECTED) openSelectedTreeFiles();
 }
 
 void QuickOpen::expandAllFolders()
@@ -1770,10 +1947,94 @@ void QuickOpen::openSearchResult()
     SendMessageW(_npp, NPPM_DOOPEN, 0, reinterpret_cast<LPARAM>(path.c_str()));
 }
 
+void QuickOpen::createContainer()
+{
+    std::wstring name = L"Novo Projeto";
+    if (!promptForText(_window, L"Criar contêiner", L"Nome do projeto:", name)) return;
+
+    // Keep names unique and deterministic.
+    const std::wstring base = name;
+    int suffix = 2;
+    while (std::any_of(_containers.begin(), _containers.end(), [&](const WorkspaceContainer& c)
+    {
+        return _wcsicmp(c.name.c_str(), name.c_str()) == 0;
+    }))
+    {
+        name = base + L" " + std::to_wstring(suffix++);
+    }
+
+    _containers.push_back({name, {}});
+    writeWorkspaceFile();
+    rebuildWorkspaceTree(false);
+}
+
+void QuickOpen::renameContainer(size_t index)
+{
+    if (index >= _containers.size()) return;
+    std::wstring name = _containers[index].name;
+    if (!promptForText(_window, L"Renomear contêiner", L"Nome do projeto:", name)) return;
+    if (name.empty()) return;
+
+    for (size_t i = 0; i < _containers.size(); ++i)
+    {
+        if (i != index && _wcsicmp(_containers[i].name.c_str(), name.c_str()) == 0)
+        {
+            MessageBoxW(_window, L"Já existe um projeto com esse nome.", L"NPPWorkSpace", MB_ICONWARNING);
+            return;
+        }
+    }
+    _containers[index].name = name;
+    writeWorkspaceFile();
+    rebuildWorkspaceTree(false);
+}
+
+void QuickOpen::removeContainer(size_t index)
+{
+    if (index >= _containers.size()) return;
+    const std::wstring question = L"Excluir o contêiner \"" + _containers[index].name +
+                                  L"\"? As pastas serão mantidas na Workspace, fora do projeto.";
+    if (MessageBoxW(_window, question.c_str(), L"Excluir contêiner", MB_ICONQUESTION | MB_YESNO) != IDYES)
+        return;
+
+    for (const auto& folder : _containers[index].folders)
+    {
+        if (std::find(_savedRoots.begin(), _savedRoots.end(), folder) == _savedRoots.end())
+            _savedRoots.push_back(folder);
+    }
+    _containers.erase(_containers.begin() + static_cast<std::ptrdiff_t>(index));
+    writeWorkspaceFile();
+    rebuildWorkspaceTree(false);
+}
+
+void QuickOpen::moveFolderToContainer(const std::filesystem::path& folder, size_t containerIndex)
+{
+    if (containerIndex >= _containers.size() || folder.empty()) return;
+
+    for (auto& container : _containers)
+        container.folders.erase(std::remove(container.folders.begin(), container.folders.end(), folder), container.folders.end());
+    _savedRoots.erase(std::remove(_savedRoots.begin(), _savedRoots.end(), folder), _savedRoots.end());
+
+    auto& target = _containers[containerIndex].folders;
+    if (std::find(target.begin(), target.end(), folder) == target.end())
+        target.push_back(folder);
+
+    writeWorkspaceFile();
+    rebuildWorkspaceTree(false);
+}
+
 void QuickOpen::addFolder()
 {
     std::filesystem::path folder;
     if (!chooseFolder(_window, folder)) return;
+
+    HTREEITEM selected = TreeView_GetSelection(_tree);
+    auto node = _nodeData.find(selected);
+    if (node != _nodeData.end() && node->second.type == NodeType::Container &&
+        node->second.containerIndex < _containers.size())
+    {
+        moveFolderToContainer(folder, node->second.containerIndex);
+        return;
+    }
 
     if (std::find(_savedRoots.begin(), _savedRoots.end(), folder) == _savedRoots.end())
         _savedRoots.push_back(folder);
@@ -1787,11 +2048,25 @@ void QuickOpen::removeSelectedRoot()
     HTREEITEM selected = TreeView_GetSelection(_tree);
     if (!selected) return;
     auto it = _nodeData.find(selected);
-    if (it == _nodeData.end() || it->second.type != NodeType::Root) return;
-    if (it->second.fromNppWorkspace) return;
+    if (it == _nodeData.end()) return;
+
+    if (it->second.type == NodeType::Container)
+    {
+        removeContainer(it->second.containerIndex);
+        return;
+    }
+    if (it->second.type != NodeType::Root || it->second.fromNppWorkspace) return;
 
     const auto path = it->second.path;
-    _savedRoots.erase(std::remove(_savedRoots.begin(), _savedRoots.end(), path), _savedRoots.end());
+    if (it->second.containerIndex < _containers.size())
+    {
+        auto& folders = _containers[it->second.containerIndex].folders;
+        folders.erase(std::remove(folders.begin(), folders.end(), path), folders.end());
+    }
+    else
+    {
+        _savedRoots.erase(std::remove(_savedRoots.begin(), _savedRoots.end(), path), _savedRoots.end());
+    }
     writeWorkspaceFile();
     rebuildWorkspaceTree();
 }
@@ -1808,6 +2083,7 @@ void QuickOpen::newWorkspace()
     if (answer == IDYES && !saveWorkspace()) return;
 
     _savedRoots.clear();
+    _containers.clear();
     _workspaceFile.clear();
     clearSearchResults();
     rebuildWorkspaceTree(false);
@@ -1818,6 +2094,77 @@ bool QuickOpen::saveWorkspace()
 {
     // Explicit Save always asks where the .worknpp should be written.
     return saveWorkspaceAs();
+}
+
+bool QuickOpen::loadContainersFromJson(const std::wstring& json, std::vector<WorkspaceContainer>& containers)
+{
+    const std::wstring needle = L"\"containers\"";
+    const size_t keyPos = json.find(needle);
+    if (keyPos == std::wstring::npos) return false;
+    size_t open = json.find(L'[', keyPos + needle.size());
+    if (open == std::wstring::npos) return false;
+
+    bool inString = false;
+    bool escaped = false;
+    int depth = 0;
+    size_t close = std::wstring::npos;
+    for (size_t i = open; i < json.size(); ++i)
+    {
+        const wchar_t ch = json[i];
+        if (inString)
+        {
+            if (escaped) escaped = false;
+            else if (ch == L'\\') escaped = true;
+            else if (ch == L'"') inString = false;
+            continue;
+        }
+        if (ch == L'"') { inString = true; continue; }
+        if (ch == L'[') ++depth;
+        else if (ch == L']' && --depth == 0) { close = i; break; }
+    }
+    if (close == std::wstring::npos) return false;
+
+    size_t pos = open + 1;
+    while (pos < close)
+    {
+        while (pos < close && (iswspace(json[pos]) || json[pos] == L',')) ++pos;
+        if (pos >= close) break;
+        if (json[pos] != L'{') return false;
+
+        const size_t objectStart = pos;
+        int objectDepth = 0;
+        inString = false;
+        escaped = false;
+        size_t objectEnd = std::wstring::npos;
+        for (; pos < close; ++pos)
+        {
+            const wchar_t ch = json[pos];
+            if (inString)
+            {
+                if (escaped) escaped = false;
+                else if (ch == L'\\') escaped = true;
+                else if (ch == L'"') inString = false;
+                continue;
+            }
+            if (ch == L'"') { inString = true; continue; }
+            if (ch == L'{') ++objectDepth;
+            else if (ch == L'}' && --objectDepth == 0) { objectEnd = pos; ++pos; break; }
+        }
+        if (objectEnd == std::wstring::npos) return false;
+
+        const std::wstring object = json.substr(objectStart, objectEnd - objectStart + 1);
+        WorkspaceContainer container;
+        if (!extractJsonString(object, L"name", container.name) || container.name.empty())
+            continue;
+        std::vector<std::wstring> folders;
+        if (extractJsonStringArray(object, L"folders", folders))
+        {
+            for (const auto& folder : folders)
+                if (!folder.empty()) container.folders.emplace_back(folder);
+        }
+        containers.push_back(std::move(container));
+    }
+    return true;
 }
 
 bool QuickOpen::writeWorkspaceFile()
@@ -1832,13 +2179,28 @@ bool QuickOpen::writeWorkspaceFile()
     std::wstringstream json;
     json << L"{\n";
     json << L"  \"format\": \"NPPWorkSpace\",\n";
-    json << L"  \"version\": 1,\n";
+    json << L"  \"version\": 2,\n";
     json << L"  \"workspace\": {\n";
     json << L"    \"folders\": [\n";
     for (size_t i = 0; i < _savedRoots.size(); ++i)
     {
         json << L"      \"" << jsonEscape(_savedRoots[i].wstring()) << L"\"";
         if (i + 1 < _savedRoots.size()) json << L',';
+        json << L"\n";
+    }
+    json << L"    ],\n";
+    json << L"    \"containers\": [\n";
+    for (size_t i = 0; i < _containers.size(); ++i)
+    {
+        const auto& container = _containers[i];
+        json << L"      {\"name\": \"" << jsonEscape(container.name) << L"\", \"folders\": [";
+        for (size_t j = 0; j < container.folders.size(); ++j)
+        {
+            if (j) json << L", ";
+            json << L"\"" << jsonEscape(container.folders[j].wstring()) << L"\"";
+        }
+        json << L"]}";
+        if (i + 1 < _containers.size()) json << L',';
         json << L"\n";
     }
     json << L"    ],\n";
@@ -1906,6 +2268,9 @@ bool QuickOpen::loadWorkspaceFile(const std::wstring& filePath)
     std::vector<std::wstring> folders;
     if (!extractJsonStringArray(json, L"folders", folders)) return false;
 
+    std::vector<WorkspaceContainer> containers;
+    loadContainersFromJson(json, containers);
+
     std::wstring toggleShortcut;
     std::wstring searchShortcut;
     if (extractJsonString(json, L"toggleWorkspace", toggleShortcut))
@@ -1924,6 +2289,7 @@ bool QuickOpen::loadWorkspaceFile(const std::wstring& filePath)
 
     // Only replace the current workspace after the file was parsed successfully.
     _savedRoots = std::move(loaded);
+    _containers = std::move(containers);
     _workspaceFile = filePath;
     clearSearchResults();
     saveSettings();
@@ -1942,7 +2308,16 @@ void QuickOpen::loadWorkspace()
 
 std::vector<std::filesystem::path> QuickOpen::getWorkspaceRootsForPanel() const
 {
-    return _savedRoots;
+    std::vector<std::filesystem::path> roots;
+    auto addUnique = [&](const std::filesystem::path& root)
+    {
+        if (!root.empty() && std::find(roots.begin(), roots.end(), root) == roots.end())
+            roots.push_back(root);
+    };
+    for (const auto& root : _savedRoots) addUnique(root);
+    for (const auto& container : _containers)
+        for (const auto& root : container.folders) addUnique(root);
+    return roots;
 }
 
 std::wstring QuickOpen::getSettingsPath() const
@@ -2017,7 +2392,7 @@ void QuickOpen::applyTheme()
 
     for (HWND h : {_searchGroup, _workspaceGroup, _search, _tree, _results,
                    _addFolder, _newWorkspace, _saveWorkspace, _openWorkspace, _removeFolder,
-                   _expandAll, _collapseAll, _status})
+                   _expandAll, _collapseAll, _createContainer, _status})
     {
         if (h) SendMessageW(_npp, NPPM_DARKMODESUBCLASSANDTHEME,
                             static_cast<WPARAM>(NppDarkMode::dmfHandleChange), reinterpret_cast<LPARAM>(h));
@@ -2121,6 +2496,7 @@ LRESULT QuickOpen::handleMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
         if (id == ID_REMOVE) { removeSelectedRoot(); return 0; }
         if (id == ID_EXPAND_ALL) { expandAllFolders(); return 0; }
         if (id == ID_COLLAPSE_ALL) { collapseAllFolders(); return 0; }
+        if (id == ID_CREATE_CONTAINER) { createContainer(); return 0; }
         break;
     }
 
@@ -2198,8 +2574,8 @@ LRESULT QuickOpen::handleMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
                         TreeView_SelectItem(_tree, item);
                         toggleTreeFileSelection(item, false);
                     }
-                    showTreeContextMenu(item, pt);
                 }
+                showTreeContextMenu(item, pt);
                 return 0;
             }
         }

@@ -79,12 +79,19 @@ private:
     QuickOpen(const QuickOpen&) = delete;
     QuickOpen& operator=(const QuickOpen&) = delete;
 
-    enum class NodeType { Root, Folder, File };
+    enum class NodeType { Container, Root, Folder, File };
     struct NodeData
     {
         NodeType type{NodeType::Folder};
         std::filesystem::path path;
         bool fromNppWorkspace{false};
+        size_t containerIndex{static_cast<size_t>(-1)};
+    };
+
+    struct WorkspaceContainer
+    {
+        std::wstring name;
+        std::vector<std::filesystem::path> folders;
     };
 
     struct SearchResult
@@ -122,11 +129,12 @@ private:
     void rebuildWorkspaceTree(bool preserveExpansion = true);
     void populateDirectory(HWND tree, HTREEITEM parent, const std::filesystem::path& directory,
                            bool rootNode, bool fromNppWorkspace, std::unordered_map<HTREEITEM, NodeData>& nodes);
-    void addRootToTree(const std::filesystem::path& root, bool fromNppWorkspace);
+    void addRootToTree(const std::filesystem::path& root, bool fromNppWorkspace, HTREEITEM parent = TVI_ROOT, size_t containerIndex = static_cast<size_t>(-1));
+    void addContainerToTree(size_t containerIndex);
     void addDirectoryChildren(HWND tree, HTREEITEM parent, const std::filesystem::path& directory,
                               bool fromNppWorkspace);
     void addNode(HWND tree, HTREEITEM parent, const std::wstring& label, const std::filesystem::path& path,
-                 NodeType type, bool fromNppWorkspace, bool hasChildren);
+                 NodeType type, bool fromNppWorkspace, bool hasChildren, size_t containerIndex = static_cast<size_t>(-1));
     void expandNode(HTREEITEM item);
     void clearTreeData();
 
@@ -147,6 +155,10 @@ private:
     void handleTreeDoubleClick(LPNMTREEVIEWW tv);
     void handleTreeItemExpanding(LPNMTREEVIEWW tv);
     void showTreeContextMenu(HTREEITEM item, POINT screenPoint);
+    void createContainer();
+    void renameContainer(size_t index);
+    void removeContainer(size_t index);
+    void moveFolderToContainer(const std::filesystem::path& folder, size_t containerIndex);
     void expandAllFolders();
     void collapseAllFolders();
 
@@ -175,6 +187,7 @@ private:
     bool saveWorkspace();
     bool saveWorkspaceAs();
     bool writeWorkspaceFile();
+    bool loadContainersFromJson(const std::wstring& json, std::vector<WorkspaceContainer>& containers);
     void openWorkspaceFile();
     bool loadWorkspaceFile(const std::wstring& filePath);
     void loadWorkspace();
@@ -205,6 +218,7 @@ private:
     HWND _removeFolder{};
     HWND _expandAll{};
     HWND _collapseAll{};
+    HWND _createContainer{};
     HWND _status{};
     HWND _searchGroup{};
     HWND _workspaceGroup{};
@@ -228,6 +242,7 @@ private:
     WNDPROC _oldPopupSearchProc{};
 
     std::vector<std::filesystem::path> _savedRoots;
+    std::vector<WorkspaceContainer> _containers;
     std::wstring _workspaceFile;
     std::vector<std::filesystem::path> _nppRoots;
     std::vector<SearchResult> _searchResults;
