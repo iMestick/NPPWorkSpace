@@ -35,6 +35,7 @@ constexpr int ID_OPEN = 1014;
 constexpr int ID_REMOVE = 1007;
 constexpr int ID_EXPAND_ALL = 1012;
 constexpr int ID_COLLAPSE_ALL = 1013;
+constexpr int ID_OPEN_SELECTED = 1015;
 constexpr int ID_STATUS = 1009;
 constexpr int ID_SEARCH_GROUP = 1010;
 constexpr int ID_WORKSPACE_GROUP = 1011;
@@ -702,7 +703,7 @@ void QuickOpen::createControls()
         GetModuleHandleW(nullptr), nullptr);
 
     _results = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
-        WS_CHILD | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+        WS_CHILD | LVS_REPORT | LVS_SHOWSELALWAYS,
         10, 126, 410, 500, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_RESULTS)),
         GetModuleHandleW(nullptr), nullptr);
 
@@ -927,7 +928,7 @@ void QuickOpen::createSearchPopup()
                  reinterpret_cast<LPARAM>(L"Nome do arquivo/pasta ou >texto para pesquisar dentro dos arquivos..."));
 
     _searchPopupResults = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
-        WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+        WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SHOWSELALWAYS,
         12, 78, 720, 310, _searchPopup, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_POPUP_RESULTS)),
         GetModuleHandleW(nullptr), nullptr);
     SendMessageW(_searchPopupResults, WM_SETFONT, reinterpret_cast<WPARAM>(_font), TRUE);
@@ -1073,6 +1074,7 @@ void QuickOpen::refreshWorkspace()
 
 void QuickOpen::clearTreeData()
 {
+    _selectedTreeFiles.clear();
     _nodeData.clear();
 }
 
@@ -1210,8 +1212,74 @@ void QuickOpen::populateDirectory(HWND tree, HTREEITEM parent,
     else addDirectoryChildren(tree, parent, directory, fromNppWorkspace);
 }
 
+void QuickOpen::clearTreeFileSelection()
+{
+    _selectedTreeFiles.clear();
+    if (_tree) InvalidateRect(_tree, nullptr, TRUE);
+}
+
+bool QuickOpen::isTreeFileSelected(HTREEITEM item) const
+{
+    return item && _selectedTreeFiles.find(item) != _selectedTreeFiles.end();
+}
+
+void QuickOpen::toggleTreeFileSelection(HTREEITEM item, bool ctrlDown)
+{
+    auto it = _nodeData.find(item);
+    if (it == _nodeData.end()) return;
+
+    if (it->second.type != NodeType::File)
+    {
+        if (!ctrlDown)
+        {
+            _selectedTreeFiles.clear();
+            InvalidateRect(_tree, nullptr, TRUE);
+        }
+        return;
+    }
+
+    if (!ctrlDown)
+        _selectedTreeFiles.clear();
+
+    if (ctrlDown && isTreeFileSelected(item))
+        _selectedTreeFiles.erase(item);
+    else
+        _selectedTreeFiles.insert(item);
+
+    InvalidateRect(_tree, nullptr, TRUE);
+}
+
+void QuickOpen::openSelectedTreeFiles()
+{
+    std::vector<std::wstring> paths;
+    for (HTREEITEM item : _selectedTreeFiles)
+    {
+        auto it = _nodeData.find(item);
+        if (it != _nodeData.end() && it->second.type == NodeType::File)
+            paths.push_back(it->second.path.wstring());
+    }
+
+    // If there is no multi-selection, keep the normal single-file behavior.
+    if (paths.empty())
+    {
+        HTREEITEM item = TreeView_GetSelection(_tree);
+        auto it = _nodeData.find(item);
+        if (it != _nodeData.end() && it->second.type == NodeType::File)
+            paths.push_back(it->second.path.wstring());
+    }
+
+    for (const auto& path : paths)
+        SendMessageW(_npp, NPPM_DOOPEN, 0, reinterpret_cast<LPARAM>(path.c_str()));
+}
+
 void QuickOpen::openTreeSelection()
 {
+    if (!_selectedTreeFiles.empty())
+    {
+        openSelectedTreeFiles();
+        return;
+    }
+
     HTREEITEM item = TreeView_GetSelection(_tree);
     if (!item) return;
 
@@ -1235,15 +1303,60 @@ void QuickOpen::openTreeSelection()
     }
 }
 
-void QuickOpen::showTreeContextMenu(HTREEITEM item, POINT screenPoint)
+void QuickOpen::showResultsContextMenu(HWND list, POINT screenPoint)
 {
-    auto it = _nodeData.find(item);
-    if (it == _nodeData.end() || it->second.type != NodeType::Root || it->second.fromNppWorkspace)
-        return;
+    if (!list) return;
+    const int count = ListView_GetSelectedCount(list);
+    if (count <= 0) return;
 
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
-    AppendMenuW(menu, MF_STRING, ID_REMOVE, L"Remover pasta do NPPWorkSpace");
+    AppendMenuW(menu, MF_STRING, ID_OPEN_SELECTED, L"Abrir arquivos selecionados");
+    SetForegroundWindow(list);
+    TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_LEFTALIGN, screenPoint.x, screenPoint.y, 0,
+                   (list == _searchPopupResults ? _searchPopup : _window), nullptr);
+    DestroyMenu(menu);
+}
+
+void QuickOpen::openSelectedResults(HWND list, bool closePopup)
+{
+    if (!list) return;
+
+    std::vector<size_t> indexes;
+    for (int row = -1; (row = ListView_GetNextItem(list, row, LVNI_SELECTED)) >= 0; )
+    {
+        if (row >= 0 && row < static_cast<int>(_searchResults.size()))
+            indexes.push_back(static_cast<size_t>(row));
+    }
+
+    for (size_t index : indexes)
+    {
+        const std::wstring path = _searchResults[index].path.wstring();
+        SendMessageW(_npp, NPPM_DOOPEN, 0, reinterpret_cast<LPARAM>(path.c_str()));
+    }
+
+    if (closePopup) hideSearchPopup();
+}
+
+void QuickOpen::showTreeContextMenu(HTREEITEM item, POINT screenPoint)
+{
+    auto it = _nodeData.find(item);
+    if (it == _nodeData.end()) return;
+
+    const bool selectedFiles = !_selectedTreeFiles.empty();
+    const bool singleRoot = it->second.type == NodeType::Root && !it->second.fromNppWorkspace;
+    if (!selectedFiles && !singleRoot) return;
+
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+
+    if (selectedFiles)
+        AppendMenuW(menu, MF_STRING, ID_OPEN_SELECTED, L"Abrir arquivos selecionados");
+    if (selectedFiles && singleRoot)
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    if (singleRoot)
+        AppendMenuW(menu, MF_STRING, ID_REMOVE, L"Remover pasta do NPPWorkSpace");
+
     SetForegroundWindow(_window);
     TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_LEFTALIGN, screenPoint.x, screenPoint.y, 0, _window, nullptr);
     DestroyMenu(menu);
@@ -1979,6 +2092,11 @@ LRESULT QuickOpen::handleMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
         if (id == ID_NEW) { newWorkspace(); return 0; }
         if (id == ID_SAVE) { saveWorkspace(); return 0; }
         if (id == ID_OPEN) { openWorkspaceFile(); return 0; }
+        if (id == ID_OPEN_SELECTED) {
+            if (_searchOnly) openSelectedResults(_results);
+            else openSelectedTreeFiles();
+            return 0;
+        }
         if (id == ID_REMOVE) { removeSelectedRoot(); return 0; }
         if (id == ID_EXPAND_ALL) { expandAllFolders(); return 0; }
         if (id == ID_COLLAPSE_ALL) { collapseAllFolders(); return 0; }
@@ -1994,6 +2112,37 @@ LRESULT QuickOpen::handleMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
         {
             const auto* tv = reinterpret_cast<const NMTREEVIEWW*>(l);
             if (hdr->code == NM_DBLCLK) { handleTreeDoubleClick(const_cast<NMTREEVIEWW*>(tv)); return 0; }
+            if (hdr->code == NM_CLICK)
+            {
+                POINT pt{};
+                GetCursorPos(&pt);
+                POINT client = pt;
+                ScreenToClient(_tree, &client);
+                TVHITTESTINFO hit{};
+                hit.pt = client;
+                HTREEITEM clicked = TreeView_HitTest(_tree, &hit);
+                if (clicked && (hit.flags & TVHT_ONITEM))
+                {
+                    const bool ctrlDown = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+                    toggleTreeFileSelection(clicked, ctrlDown);
+                }
+                return 0;
+            }
+            if (hdr->code == NM_CUSTOMDRAW)
+            {
+                auto* cd = reinterpret_cast<NMTVCUSTOMDRAW*>(const_cast<NMHDR*>(hdr));
+                if (cd->nmcd.dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+                if (cd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT)
+                {
+                    const HTREEITEM item = reinterpret_cast<HTREEITEM>(cd->nmcd.dwItemSpec);
+                    if (isTreeFileSelected(item))
+                    {
+                        cd->clrTextBk = GetSysColor(COLOR_HIGHLIGHT);
+                        cd->clrText = GetSysColor(COLOR_HIGHLIGHTTEXT);
+                    }
+                    return CDRF_DODEFAULT;
+                }
+            }
             if (hdr->code == TVN_ITEMEXPANDINGW) { handleTreeItemExpanding(const_cast<NMTREEVIEWW*>(tv)); return 0; }
             if (hdr->code == NM_RCLICK)
             {
@@ -2006,16 +2155,32 @@ LRESULT QuickOpen::handleMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
                 HTREEITEM item = TreeView_HitTest(_tree, &hit);
                 if (item && (hit.flags & TVHT_ONITEM))
                 {
-                    TreeView_SelectItem(_tree, item);
+                    const bool alreadySelected = isTreeFileSelected(item);
+                    if (GetKeyState(VK_CONTROL) & 0x8000)
+                        toggleTreeFileSelection(item, true);
+                    else if (!alreadySelected)
+                    {
+                        TreeView_SelectItem(_tree, item);
+                        toggleTreeFileSelection(item, false);
+                    }
                     showTreeContextMenu(item, pt);
                 }
                 return 0;
             }
         }
-        else if (hdr->idFrom == ID_RESULTS && hdr->code == NM_DBLCLK)
+        else if (hdr->idFrom == ID_RESULTS)
         {
-            openSearchResult();
-            return 0;
+            if (hdr->code == NM_DBLCLK)
+            {
+                openSelectedResults(_results);
+                return 0;
+            }
+            if (hdr->code == NM_RCLICK)
+            {
+                POINT pt{}; GetCursorPos(&pt);
+                showResultsContextMenu(_results, pt);
+                return 0;
+            }
         }
         break;
     }
@@ -2150,6 +2315,11 @@ LRESULT QuickOpen::handleSearchPopupMessage(HWND h, UINT msg, WPARAM w, LPARAM l
         }
         break;
     case WM_COMMAND:
+        if (LOWORD(w) == ID_OPEN_SELECTED)
+        {
+            openSelectedResults(_searchPopupResults, true);
+            return 0;
+        }
         if (LOWORD(w) == ID_POPUP_SEARCH && HIWORD(w) == EN_CHANGE)
         {
             scheduleSearch(true);
@@ -2159,11 +2329,19 @@ LRESULT QuickOpen::handleSearchPopupMessage(HWND h, UINT msg, WPARAM w, LPARAM l
     case WM_NOTIFY:
     {
         const auto* hdr = reinterpret_cast<const NMHDR*>(l);
-        if (hdr && hdr->idFrom == ID_POPUP_RESULTS &&
-            (hdr->code == NM_DBLCLK || hdr->code == NM_RETURN || hdr->code == LVN_ITEMACTIVATE))
+        if (hdr && hdr->idFrom == ID_POPUP_RESULTS)
         {
-            openPopupSearchResult();
-            return 0;
+            if (hdr->code == NM_DBLCLK || hdr->code == NM_RETURN || hdr->code == LVN_ITEMACTIVATE)
+            {
+                openSelectedResults(_searchPopupResults, true);
+                return 0;
+            }
+            if (hdr->code == NM_RCLICK)
+            {
+                POINT pt{}; GetCursorPos(&pt);
+                showResultsContextMenu(_searchPopupResults, pt);
+                return 0;
+            }
         }
         break;
     }

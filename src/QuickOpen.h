@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 
 // Workspace shortcut accessors implemented by PluginDefinition.cpp.
 std::wstring NPPWorkSpace_GetToggleShortcut();
@@ -137,6 +138,12 @@ private:
     static bool isHiddenSystemDirectory(const std::filesystem::path& p);
 
     void openTreeSelection();
+    void openSelectedTreeFiles();
+    void toggleTreeFileSelection(HTREEITEM item, bool ctrlDown);
+    bool isTreeFileSelected(HTREEITEM item) const;
+    void clearTreeFileSelection();
+    void showResultsContextMenu(HWND list, POINT screenPoint);
+    void openSelectedResults(HWND list, bool closePopup = false);
     void handleTreeDoubleClick(LPNMTREEVIEWW tv);
     void handleTreeItemExpanding(LPNMTREEVIEWW tv);
     void showTreeContextMenu(HTREEITEM item, POINT screenPoint);
@@ -225,6 +232,7 @@ private:
     std::vector<std::filesystem::path> _nppRoots;
     std::vector<SearchResult> _searchResults;
     std::unordered_map<HTREEITEM, NodeData> _nodeData;
+    std::unordered_set<HTREEITEM> _selectedTreeFiles;
 
     bool _darkMode{false};
     bool _searchOnly{false};
