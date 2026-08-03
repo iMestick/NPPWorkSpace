@@ -18,6 +18,10 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <condition_variable>
+#include <deque>
+#include <limits>
+#include <mutex>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "uxtheme.lib")
@@ -29,6 +33,8 @@ constexpr wchar_t WINDOW_CLASS[] = L"NPPWorkSpacePanel";
 constexpr wchar_t SEARCH_POPUP_CLASS[] = L"NPPWorkSpaceSearchPopup";
 constexpr wchar_t PANEL_NAME[] = L"NPPWorkSpace";
 constexpr wchar_t MODULE_NAME[] = L"NPPWorkSpace.dll";
+constexpr wchar_t REGISTRY_KEY[] = L"Software\\NPPWorkSpace";
+constexpr wchar_t REGISTRY_WORKSPACE_VALUE[] = L"WorkspaceFile";
 
 constexpr int ID_TITLE = 1000;
 constexpr int ID_SEARCH = 1001;
@@ -46,15 +52,45 @@ constexpr int ID_OPEN_SELECTED = 1015;
 constexpr int ID_STATUS = 1009;
 constexpr int ID_SEARCH_GROUP = 1010;
 constexpr int ID_SEARCH_SCOPE = 1017;
+constexpr int ID_CONTENT_SEARCH = 1018;
+constexpr int ID_CANCEL_SEARCH = 1019;
+constexpr int ID_SEARCH_PROGRESS = 1020;
+constexpr int ID_SEARCH_PROGRESS_TEXT = 1021;
+constexpr int ID_RUN_SEARCH = 1022;
+constexpr int ID_VIEW_FOLDERS = 1023;
+constexpr int ID_VIEW_SEARCH = 1024;
+constexpr int ID_CONTAINER_COLOR = 1025;
 constexpr int ID_WORKSPACE_GROUP = 1011;
 constexpr int ID_POPUP_SEARCH = 1200;
 constexpr int ID_POPUP_RESULTS = 1201;
+constexpr int ID_POPUP_CONTENT_SEARCH = 1202;
+constexpr int ID_POPUP_RUN_SEARCH = 1203;
 constexpr UINT_PTR WORKSPACE_SYNC_TIMER = 4101;
-constexpr UINT_PTR SEARCH_DEBOUNCE_TIMER = 4102;
-constexpr UINT SEARCH_DEBOUNCE_MS = 220;
 constexpr UINT WM_SEARCH_INDEX_READY = WM_APP + 0x5A1;
+constexpr UINT WM_CONTENT_SEARCH_BATCH = WM_APP + 0x5A2;
+constexpr UINT WM_CONTENT_SEARCH_PROGRESS = WM_APP + 0x5A3;
+constexpr UINT WM_CONTENT_SEARCH_DONE = WM_APP + 0x5A4;
 constexpr size_t MAX_CONTENT_FILE_SIZE = 16ull * 1024ull * 1024ull;
-constexpr size_t CONTENT_CHUNK_SIZE = 1024ull * 1024ull;
+constexpr size_t CONTENT_BATCH_FILE_COUNT = 8;
+constexpr size_t CONTENT_QUEUE_LIMIT = 512;
+constexpr size_t MAX_SNIPPET_CHARS = 220;
+
+constexpr UINT SCI_GOTOPOS = 2025;
+constexpr UINT SCI_SETANCHOR = 2026;
+constexpr UINT SCI_GETCODEPAGE = 2137;
+constexpr UINT SCI_GETLINEENDPOSITION = 2136;
+constexpr UINT SCI_POSITIONFROMLINE = 2167;
+constexpr UINT SCI_SCROLLCARET = 2169;
+constexpr UINT SCI_SETTARGETSTART = 2190;
+constexpr UINT SCI_GETTARGETSTART = 2191;
+constexpr UINT SCI_SETTARGETEND = 2192;
+constexpr UINT SCI_GETTARGETEND = 2193;
+constexpr UINT SCI_SEARCHINTARGET = 2197;
+constexpr UINT SCI_SETSEARCHFLAGS = 2198;
+constexpr UINT SCI_ENSUREVISIBLEENFORCEPOLICY = 2234;
+constexpr UINT SCI_SETVISIBLEPOLICY = 2394;
+constexpr WPARAM CARET_EVEN = 0x08;
+constexpr WPARAM CARET_JUMPS = 0x10;
 
 constexpr int ID_NODE_DUMMY = 2000;
 constexpr int MAX_SEARCH_RESULTS = 250;
@@ -68,6 +104,453 @@ struct SortingData4lParamMirror
     std::wstring _label;
     bool _isFolder = false;
 };
+
+enum class TextEncoding
+{
+    Unknown,
+    Utf8,
+    Utf8Bom,
+    Utf16LE,
+    Utf16BE,
+    ShiftJis,
+    Big5,
+    Ansi
+};
+
+struct SnippetInfo
+{
+    std::wstring text;
+    size_t matchStart{};
+};
+
+void setButtonChecked(HWND button, bool checked)
+{
+    if (button) SendMessageW(button, BM_SETCHECK, checked ? BST_CHECKED : BST_UNCHECKED, 0);
+}
+
+bool isButtonChecked(HWND button)
+{
+    return button && SendMessageW(button, BM_GETCHECK, 0, 0) == BST_CHECKED;
+}
+
+#ifdef _DEBUG
+void debugLog(const std::wstring& message)
+{
+    OutputDebugStringW((L"[NPPWorkSpace] " + message + L"\n").c_str());
+}
+#define QO_DEBUG_LOG(expr) debugLog((expr))
+#else
+#define QO_DEBUG_LOG(expr) ((void)0)
+#endif
+
+const wchar_t* encodingName(TextEncoding encoding)
+{
+    switch (encoding)
+    {
+    case TextEncoding::Utf8: return L"UTF-8";
+    case TextEncoding::Utf8Bom: return L"UTF-8 BOM";
+    case TextEncoding::Utf16LE: return L"UTF-16 LE";
+    case TextEncoding::Utf16BE: return L"UTF-16 BE";
+    case TextEncoding::ShiftJis: return L"Shift-JIS";
+    case TextEncoding::Big5: return L"Big5";
+    case TextEncoding::Ansi: return L"ANSI";
+    default: return L"Unknown";
+    }
+}
+
+std::wstring lowerText(std::wstring value)
+{
+    std::transform(value.begin(), value.end(), value.begin(),
+        [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
+    return value;
+}
+
+bool isSupportedTextExtension(const std::filesystem::path& path)
+{
+    std::wstring ext = lowerText(path.extension().wstring());
+    static const std::array<const wchar_t*, 17> textExts = {
+        L".ini", L".txt", L".json", L".xml", L".lua", L".cfg", L".conf",
+        L".csv", L".log", L".hpp", L".h", L".cpp", L".c", L".cs", L".py",
+        L".js", L".ts"
+    };
+    return std::find_if(textExts.begin(), textExts.end(),
+        [&](const wchar_t* allowed) { return ext == allowed; }) != textExts.end();
+}
+
+bool isAsciiString(const std::wstring& value)
+{
+    return std::all_of(value.begin(), value.end(), [](wchar_t ch) { return ch >= 0 && ch < 0x80; });
+}
+
+std::wstring normalizeScopePath(std::wstring value)
+{
+    value = lowerText(std::move(value));
+    std::replace(value.begin(), value.end(), L'/', L'\\');
+    while (!value.empty() && value.back() == L'\\')
+        value.pop_back();
+    return value;
+}
+
+bool isPathEnabledForScope(const std::filesystem::path& path,
+                           const std::unordered_set<std::wstring>& includedPaths,
+                           const std::unordered_set<std::wstring>& disabledPaths)
+{
+    std::wstring value = normalizeScopePath(path.wstring());
+    if (!value.empty()) value.push_back(L'\\');
+
+    auto isUnderAny = [&](const std::unordered_set<std::wstring>& roots)
+    {
+        for (const auto& root : roots)
+        {
+            std::wstring prefix = normalizeScopePath(root);
+            if (!prefix.empty()) prefix.push_back(L'\\');
+            if (!prefix.empty() && value.size() >= prefix.size() &&
+                value.compare(0, prefix.size(), prefix) == 0)
+                return true;
+        }
+        return false;
+    };
+
+    if (!includedPaths.empty() && !isUnderAny(includedPaths)) return false;
+    if (!disabledPaths.empty() && isUnderAny(disabledPaths)) return false;
+    return true;
+}
+
+bool isPathEnabledForScope(const std::filesystem::path& path, const std::unordered_set<std::wstring>& disabledPaths)
+{
+    static const std::unordered_set<std::wstring> emptyIncludedPaths;
+    return isPathEnabledForScope(path, emptyIncludedPaths, disabledPaths);
+}
+
+COLORREF defaultContainerColor(size_t index)
+{
+    static constexpr COLORREF palette[] = {
+        RGB(86, 156, 214),
+        RGB(78, 201, 176),
+        RGB(206, 145, 120),
+        RGB(220, 220, 170),
+        RGB(197, 134, 192),
+        RGB(181, 206, 168),
+        RGB(244, 166, 88),
+        RGB(114, 159, 207)
+    };
+    return palette[index % std::size(palette)];
+}
+
+std::wstring colorToHex(COLORREF color)
+{
+    wchar_t buffer[8]{};
+    swprintf_s(buffer, L"#%02X%02X%02X", GetRValue(color), GetGValue(color), GetBValue(color));
+    return buffer;
+}
+
+int hexValue(wchar_t ch)
+{
+    if (ch >= L'0' && ch <= L'9') return ch - L'0';
+    if (ch >= L'a' && ch <= L'f') return ch - L'a' + 10;
+    if (ch >= L'A' && ch <= L'F') return ch - L'A' + 10;
+    return -1;
+}
+
+bool parseHexColor(const std::wstring& value, COLORREF& color)
+{
+    size_t offset = !value.empty() && value[0] == L'#' ? 1 : 0;
+    if (value.size() - offset != 6) return false;
+
+    int channels[3]{};
+    for (size_t i = 0; i < 3; ++i)
+    {
+        const int hi = hexValue(value[offset + i * 2]);
+        const int lo = hexValue(value[offset + i * 2 + 1]);
+        if (hi < 0 || lo < 0) return false;
+        channels[i] = (hi << 4) | lo;
+    }
+    color = RGB(channels[0], channels[1], channels[2]);
+    return true;
+}
+
+unsigned char foldAscii(unsigned char ch)
+{
+    return (ch >= 'A' && ch <= 'Z') ? static_cast<unsigned char>(ch + ('a' - 'A')) : ch;
+}
+
+bool containsAsciiBytesInsensitive(const std::vector<unsigned char>& data, const std::string& needle)
+{
+    if (needle.empty() || data.size() < needle.size()) return false;
+
+    std::string foldedNeedle = needle;
+    for (char& ch : foldedNeedle)
+        ch = static_cast<char>(foldAscii(static_cast<unsigned char>(ch)));
+
+    const size_t m = foldedNeedle.size();
+    size_t skip[256];
+    for (size_t i = 0; i < std::size(skip); ++i) skip[i] = m;
+    for (size_t i = 0; i + 1 < m; ++i)
+        skip[foldAscii(static_cast<unsigned char>(foldedNeedle[i]))] = m - 1 - i;
+
+    for (size_t pos = 0; pos + m <= data.size(); )
+    {
+        size_t j = m;
+        while (j > 0 &&
+               foldAscii(data[pos + j - 1]) == static_cast<unsigned char>(foldedNeedle[j - 1]))
+            --j;
+        if (j == 0) return true;
+        pos += skip[foldAscii(data[pos + m - 1])];
+    }
+    return false;
+}
+
+bool hasUtf16Pattern(const std::vector<unsigned char>& data)
+{
+    if (data.size() < 4) return false;
+    if ((data[0] == 0xFF && data[1] == 0xFE) || (data[0] == 0xFE && data[1] == 0xFF))
+        return true;
+
+    size_t evenZeros = 0;
+    size_t oddZeros = 0;
+    const size_t probe = (std::min)(data.size(), size_t(4096));
+    for (size_t i = 0; i < probe; ++i)
+    {
+        if (data[i] == 0)
+        {
+            if ((i & 1) == 0) ++evenZeros;
+            else ++oddZeros;
+        }
+    }
+    return oddZeros > probe / 8 || evenZeros > probe / 8;
+}
+
+bool looksBinaryWithoutUtf16(const std::vector<unsigned char>& data)
+{
+    if (data.empty()) return true;
+    if (hasUtf16Pattern(data)) return false;
+
+    size_t zeroCount = 0;
+    size_t controlCount = 0;
+    const size_t probe = (std::min)(data.size(), size_t(8192));
+    for (size_t i = 0; i < probe; ++i)
+    {
+        const unsigned char ch = data[i];
+        if (ch == 0) ++zeroCount;
+        else if (ch < 0x20 && ch != '\r' && ch != '\n' && ch != '\t' && ch != '\f')
+            ++controlCount;
+    }
+    return zeroCount > 0 || controlCount > probe / 8;
+}
+
+bool decodeWithCodePage(UINT codePage, DWORD flags, const unsigned char* data, size_t size, std::wstring& out)
+{
+    if (size == 0) { out.clear(); return true; }
+    if (size > static_cast<size_t>((std::numeric_limits<int>::max)())) return false;
+    const int inputSize = static_cast<int>(size);
+    const auto* bytes = reinterpret_cast<LPCCH>(data);
+    int needed = MultiByteToWideChar(codePage, flags, bytes, inputSize, nullptr, 0);
+    if (needed <= 0 && flags != 0)
+        needed = MultiByteToWideChar(codePage, 0, bytes, inputSize, nullptr, 0);
+    if (needed <= 0) return false;
+
+    out.assign(static_cast<size_t>(needed), L'\0');
+    int written = MultiByteToWideChar(codePage, needed > 0 && flags != 0 ? flags : 0,
+                                      bytes, inputSize, out.data(), needed);
+    if (written <= 0 && flags != 0)
+        written = MultiByteToWideChar(codePage, 0, bytes, inputSize, out.data(), needed);
+    if (written <= 0) return false;
+    out.resize(static_cast<size_t>(written));
+    return true;
+}
+
+bool decodeUtf16(const std::vector<unsigned char>& data, bool bigEndian, size_t offset, std::wstring& out)
+{
+    if (data.size() <= offset) { out.clear(); return true; }
+    const size_t units = (data.size() - offset) / 2;
+    out.assign(units, L'\0');
+    for (size_t i = 0; i < units; ++i)
+    {
+        const size_t pos = offset + i * 2;
+        const uint16_t code = bigEndian
+            ? static_cast<uint16_t>((data[pos] << 8) | data[pos + 1])
+            : static_cast<uint16_t>(data[pos] | (data[pos + 1] << 8));
+        out[i] = static_cast<wchar_t>(code);
+    }
+    return true;
+}
+
+int scoreDecodedText(const std::wstring& value)
+{
+    if (value.empty()) return 0;
+    int score = 0;
+    const size_t probe = (std::min)(value.size(), size_t(8192));
+    for (size_t i = 0; i < probe; ++i)
+    {
+        const wchar_t ch = value[i];
+        if (ch == 0 || ch == 0xFFFD)
+        {
+            score -= 20;
+        }
+        else if (ch == L'\r' || ch == L'\n' || ch == L'\t')
+        {
+            score += 1;
+        }
+        else if (ch < 0x20)
+        {
+            score -= 8;
+        }
+        else if (ch >= 0x20 && ch <= 0x7E)
+        {
+            score += 3;
+        }
+        else if ((ch >= 0x00C0 && ch <= 0x024F) || (ch >= 0x1E00 && ch <= 0x1EFF))
+        {
+            score += 4;
+        }
+        else if ((ch >= 0x3040 && ch <= 0x30FF) || (ch >= 0x4E00 && ch <= 0x9FFF))
+        {
+            score += 4;
+        }
+        else
+        {
+            score += 1;
+        }
+    }
+    return score;
+}
+
+void sanitizeDecodedText(std::wstring& value)
+{
+    for (wchar_t& ch : value)
+    {
+        if (ch == 0 || ch == 0xFFFD || (ch < 0x20 && ch != L'\r' && ch != L'\n' && ch != L'\t'))
+            ch = L' ';
+    }
+}
+
+bool decodeTextBytes(const std::vector<unsigned char>& data, std::wstring& text, TextEncoding& encoding)
+{
+    text.clear();
+    encoding = TextEncoding::Unknown;
+    if (data.empty() || looksBinaryWithoutUtf16(data)) return false;
+
+    if (data.size() >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF)
+    {
+        if (decodeWithCodePage(CP_UTF8, MB_ERR_INVALID_CHARS, data.data() + 3, data.size() - 3, text))
+        {
+            encoding = TextEncoding::Utf8Bom;
+            sanitizeDecodedText(text);
+            return true;
+        }
+    }
+    if (data.size() >= 2 && data[0] == 0xFF && data[1] == 0xFE)
+    {
+        decodeUtf16(data, false, 2, text);
+        encoding = TextEncoding::Utf16LE;
+        sanitizeDecodedText(text);
+        return true;
+    }
+    if (data.size() >= 2 && data[0] == 0xFE && data[1] == 0xFF)
+    {
+        decodeUtf16(data, true, 2, text);
+        encoding = TextEncoding::Utf16BE;
+        sanitizeDecodedText(text);
+        return true;
+    }
+
+    if (hasUtf16Pattern(data))
+    {
+        size_t evenZeros = 0;
+        size_t oddZeros = 0;
+        const size_t probe = (std::min)(data.size(), size_t(4096));
+        for (size_t i = 0; i < probe; ++i)
+        {
+            if (data[i] == 0)
+            {
+                if ((i & 1) == 0) ++evenZeros;
+                else ++oddZeros;
+            }
+        }
+        const bool bigEndian = evenZeros > oddZeros;
+        decodeUtf16(data, bigEndian, 0, text);
+        encoding = bigEndian ? TextEncoding::Utf16BE : TextEncoding::Utf16LE;
+        sanitizeDecodedText(text);
+        return scoreDecodedText(text) > 0;
+    }
+
+    std::wstring utf8;
+    if (decodeWithCodePage(CP_UTF8, MB_ERR_INVALID_CHARS, data.data(), data.size(), utf8) &&
+        scoreDecodedText(utf8) > 0)
+    {
+        text = std::move(utf8);
+        encoding = TextEncoding::Utf8;
+        sanitizeDecodedText(text);
+        return true;
+    }
+
+    struct Candidate
+    {
+        UINT codePage;
+        TextEncoding encoding;
+        DWORD flags;
+    };
+    static const Candidate candidates[] = {
+        {CP_ACP, TextEncoding::Ansi, 0},
+        {932, TextEncoding::ShiftJis, MB_ERR_INVALID_CHARS},
+        {950, TextEncoding::Big5, MB_ERR_INVALID_CHARS}
+    };
+
+    int bestScore = (std::numeric_limits<int>::min)();
+    std::wstring bestText;
+    TextEncoding bestEncoding = TextEncoding::Unknown;
+    for (const auto& candidate : candidates)
+    {
+        std::wstring decoded;
+        if (!decodeWithCodePage(candidate.codePage, candidate.flags, data.data(), data.size(), decoded))
+            continue;
+        const int score = scoreDecodedText(decoded);
+        if (score > bestScore)
+        {
+            bestScore = score;
+            bestText = std::move(decoded);
+            bestEncoding = candidate.encoding;
+        }
+    }
+
+    if (bestEncoding == TextEncoding::Unknown || bestScore <= 0) return false;
+    text = std::move(bestText);
+    encoding = bestEncoding;
+    sanitizeDecodedText(text);
+    return true;
+}
+
+SnippetInfo makeSnippet(const std::wstring& line, size_t matchStart, size_t matchLength)
+{
+    const size_t half = MAX_SNIPPET_CHARS / 2;
+    size_t start = 0;
+    if (matchStart > half) start = matchStart - half;
+
+    size_t end = (std::min)(line.size(), start + MAX_SNIPPET_CHARS);
+    if (end < matchStart + matchLength)
+    {
+        end = (std::min)(line.size(), matchStart + matchLength + half);
+        start = end > MAX_SNIPPET_CHARS ? end - MAX_SNIPPET_CHARS : 0;
+    }
+
+    std::wstring snippet = line.substr(start, end - start);
+    for (wchar_t& ch : snippet)
+    {
+        if (ch == L'\r' || ch == L'\n') ch = L' ';
+        else if (ch == L'\t') ch = L' ';
+    }
+
+    size_t adjusted = matchStart >= start ? matchStart - start : 0;
+    if (start > 0)
+    {
+        snippet.insert(0, L"... ");
+        adjusted += 4;
+    }
+    if (end < line.size())
+        snippet += L" ...";
+
+    return {std::move(snippet), adjusted};
+}
 
 std::string utf8FromWide(const std::wstring& value)
 {
@@ -207,6 +690,45 @@ bool extractJsonStringArray(const std::wstring& json, const std::wstring& key, s
     return true;
 }
 
+bool readWorkspacePathFromRegistry(std::wstring& value)
+{
+    HKEY key{};
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, REGISTRY_KEY, 0, KEY_READ, &key) != ERROR_SUCCESS)
+        return false;
+
+    DWORD type = 0;
+    DWORD bytes = 0;
+    LONG result = RegQueryValueExW(key, REGISTRY_WORKSPACE_VALUE, nullptr, &type, nullptr, &bytes);
+    if (result != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ) || bytes < sizeof(wchar_t))
+    {
+        RegCloseKey(key);
+        return false;
+    }
+
+    std::wstring buffer(bytes / sizeof(wchar_t), L'\0');
+    result = RegQueryValueExW(key, REGISTRY_WORKSPACE_VALUE, nullptr, &type,
+                              reinterpret_cast<LPBYTE>(buffer.data()), &bytes);
+    RegCloseKey(key);
+    if (result != ERROR_SUCCESS) return false;
+
+    buffer.resize(wcsnlen_s(buffer.c_str(), buffer.size()));
+    value = std::move(buffer);
+    return !value.empty();
+}
+
+void writeWorkspacePathToRegistry(const std::wstring& value)
+{
+    HKEY key{};
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, REGISTRY_KEY, 0, nullptr, 0,
+                        KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS)
+        return;
+
+    RegSetValueExW(key, REGISTRY_WORKSPACE_VALUE, 0, REG_SZ,
+                   reinterpret_cast<const BYTE*>(value.c_str()),
+                   static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t)));
+    RegCloseKey(key);
+}
+
 bool chooseFolder(HWND owner, std::filesystem::path& result)
 {
     BROWSEINFOW bi{};
@@ -295,17 +817,17 @@ INT_PTR CALLBACK textPromptProc(HWND dlg, UINT msg, WPARAM w, LPARAM l)
         {
             RECT rc{};
             GetWindowRect(dlg, &rc);
-            const int w = rc.right - rc.left;
-            const int h = rc.bottom - rc.top;
+            const int promptWidth = rc.right - rc.left;
+            const int promptHeight = rc.bottom - rc.top;
             HMONITOR monitor = MonitorFromPoint(state->screenPoint, MONITOR_DEFAULTTONEAREST);
             MONITORINFO mi{sizeof(mi)};
             GetMonitorInfoW(monitor, &mi);
             int x = state->screenPoint.x + 10;
             int y = state->screenPoint.y + 10;
-            if (x + w > mi.rcWork.right) x = state->screenPoint.x - w - 10;
-            if (y + h > mi.rcWork.bottom) y = state->screenPoint.y - h - 10;
-            x = (std::max)(static_cast<int>(mi.rcWork.left), (std::min)(x, static_cast<int>(mi.rcWork.right) - w));
-            y = (std::max)(static_cast<int>(mi.rcWork.top), (std::min)(y, static_cast<int>(mi.rcWork.bottom) - h));
+            if (x + promptWidth > mi.rcWork.right) x = state->screenPoint.x - promptWidth - 10;
+            if (y + promptHeight > mi.rcWork.bottom) y = state->screenPoint.y - promptHeight - 10;
+            x = (std::max)(static_cast<int>(mi.rcWork.left), (std::min)(x, static_cast<int>(mi.rcWork.right) - promptWidth));
+            y = (std::max)(static_cast<int>(mi.rcWork.top), (std::min)(y, static_cast<int>(mi.rcWork.bottom) - promptHeight));
             SetWindowPos(dlg, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
 
@@ -652,10 +1174,8 @@ LRESULT CALLBACK QuickOpen::dockSplitterProc(HWND h, UINT msg, WPARAM w, LPARAM 
 
 namespace
 {
-constexpr int WORKSPACE_MIN_WIDTH = 340;
-constexpr int WORKSPACE_MAX_WIDTH = 620;
-constexpr int WORKSPACE_MIN_HEIGHT = 260;
-constexpr int WORKSPACE_MAX_HEIGHT = 1000;
+constexpr int WORKSPACE_MIN_WIDTH = 430;
+constexpr int WORKSPACE_MIN_HEIGHT = 360;
 
 enum class DockSide { None, Left, Right, Top, Bottom };
 
@@ -681,40 +1201,20 @@ DockSide getDockSideForSplitter(HWND panel, HWND splitter)
     return DockSide::None;
 }
 
-bool isFloatingDockHost(HWND h)
-{
-    if (!h) return false;
-    const LONG_PTR style = GetWindowLongPtrW(h, GWL_STYLE);
-    const HWND root = GetAncestor(h, GA_ROOT);
-    return root == h && ((style & WS_CAPTION) != 0 || (style & WS_POPUP) != 0);
-}
-
-void clampWorkspaceMinMaxInfo(HWND h, MINMAXINFO* info)
+void clampWorkspaceMinMaxInfo(HWND, MINMAXINFO* info)
 {
     if (!info) return;
-    const bool floating = isFloatingDockHost(h);
     info->ptMinTrackSize.x = (std::max)(info->ptMinTrackSize.x, static_cast<LONG>(WORKSPACE_MIN_WIDTH));
-    info->ptMaxTrackSize.x = (std::min)(info->ptMaxTrackSize.x, static_cast<LONG>(WORKSPACE_MAX_WIDTH));
-    if (floating)
-    {
-        info->ptMinTrackSize.y = (std::max)(info->ptMinTrackSize.y, static_cast<LONG>(WORKSPACE_MIN_HEIGHT));
-        info->ptMaxTrackSize.y = (std::min)(info->ptMaxTrackSize.y, static_cast<LONG>(WORKSPACE_MAX_HEIGHT));
-    }
+    info->ptMinTrackSize.y = (std::max)(info->ptMinTrackSize.y, static_cast<LONG>(WORKSPACE_MIN_HEIGHT));
 }
 
-void clampWorkspaceWindowPos(HWND h, WINDOWPOS* pos)
+void clampWorkspaceWindowPos(HWND, WINDOWPOS* pos)
 {
     if (!pos || (pos->flags & SWP_NOSIZE)) return;
-    const bool floating = isFloatingDockHost(h);
     const int minWidth = static_cast<int>(WORKSPACE_MIN_WIDTH);
-    const int maxWidth = static_cast<int>(WORKSPACE_MAX_WIDTH);
-    pos->cx = (std::max)(minWidth, (std::min)(maxWidth, pos->cx));
-    if (floating)
-    {
-        const int minHeight = static_cast<int>(WORKSPACE_MIN_HEIGHT);
-        const int maxHeight = static_cast<int>(WORKSPACE_MAX_HEIGHT);
-        pos->cy = (std::max)(minHeight, (std::min)(maxHeight, pos->cy));
-    }
+    const int minHeight = static_cast<int>(WORKSPACE_MIN_HEIGHT);
+    pos->cx = (std::max)(minWidth, pos->cx);
+    pos->cy = (std::max)(minHeight, pos->cy);
 }
 }
 
@@ -792,7 +1292,6 @@ LRESULT QuickOpen::handleDockSplitterMessage(HWND h, UINT msg, WPARAM w, LPARAM 
             int current = 0;
             int delta = 0;
             int minSize = 0;
-            int maxSize = 0;
 
             switch (side)
             {
@@ -800,32 +1299,28 @@ LRESULT QuickOpen::handleDockSplitterMessage(HWND h, UINT msg, WPARAM w, LPARAM 
                 current = rc.right - rc.left;
                 delta = dx;
                 minSize = WORKSPACE_MIN_WIDTH;
-                maxSize = WORKSPACE_MAX_WIDTH;
                 break;
             case DockSide::Right:
                 current = rc.right - rc.left;
                 delta = -dx;
                 minSize = WORKSPACE_MIN_WIDTH;
-                maxSize = WORKSPACE_MAX_WIDTH;
                 break;
             case DockSide::Top:
                 current = rc.bottom - rc.top;
                 delta = dy;
                 minSize = WORKSPACE_MIN_HEIGHT;
-                maxSize = WORKSPACE_MAX_HEIGHT;
                 break;
             case DockSide::Bottom:
                 current = rc.bottom - rc.top;
                 delta = -dy;
                 minSize = WORKSPACE_MIN_HEIGHT;
-                maxSize = WORKSPACE_MAX_HEIGHT;
                 break;
             default:
                 break;
             }
 
             const int requested = current + delta;
-            const int clamped = (std::max)(minSize, (std::min)(maxSize, requested));
+            const int clamped = (std::max)(minSize, requested);
             if (clamped != requested)
             {
                 const int allowedDelta = clamped - current;
@@ -883,65 +1378,97 @@ void QuickOpen::createControls()
     // Notepad++ dialogs: search on top, workspace actions underneath.
     _searchGroup = CreateWindowExW(0, L"BUTTON", L"Pesquisar",
         WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-        8, 4, 420, 58, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_SEARCH_GROUP)),
+        8, 4, 420, 102, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_SEARCH_GROUP)),
         GetModuleHandleW(nullptr), nullptr);
 
     _search = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_NOHIDESEL,
-        18, 24, 332, 26, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_SEARCH)),
+        18, 24, 250, 26, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_SEARCH)),
+        GetModuleHandleW(nullptr), nullptr);
+    _runSearch = CreateWindowExW(0, L"BUTTON", L"Pesquisar",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        274, 24, 74, 26, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_RUN_SEARCH)),
         GetModuleHandleW(nullptr), nullptr);
     _searchScopeButton = CreateWindowExW(0, L"BUTTON", L"Escopo",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
         354, 24, 64, 26, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_SEARCH_SCOPE)),
         GetModuleHandleW(nullptr), nullptr);
+    _contentSearchCheck = CreateWindowExW(0, L"BUTTON", L"Pesquisar dentro dos arquivos",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+        18, 54, 220, 22, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_CONTENT_SEARCH)),
+        GetModuleHandleW(nullptr), nullptr);
+    _cancelSearch = CreateWindowExW(0, L"BUTTON", L"Cancelar",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        342, 52, 76, 24, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_CANCEL_SEARCH)),
+        GetModuleHandleW(nullptr), nullptr);
+    _searchProgress = CreateWindowExW(0, PROGRESS_CLASSW, L"",
+        WS_CHILD | WS_VISIBLE | PBS_SMOOTH,
+        18, 80, 150, 14, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_SEARCH_PROGRESS)),
+        GetModuleHandleW(nullptr), nullptr);
+    _searchProgressText = CreateWindowExW(0, L"STATIC", L"Pronto",
+        WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
+        176, 74, 242, 24, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_SEARCH_PROGRESS_TEXT)),
+        GetModuleHandleW(nullptr), nullptr);
+    SendMessageW(_searchProgress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
+    EnableWindow(_cancelSearch, FALSE);
+    setButtonChecked(_contentSearchCheck, _searchInsideFiles);
 
     _workspaceGroup = CreateWindowExW(0, L"BUTTON", L"Workspace",
         WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-        8, 66, 420, 52, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_WORKSPACE_GROUP)),
+        8, 110, 420, 52, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_WORKSPACE_GROUP)),
         GetModuleHandleW(nullptr), nullptr);
 
     _addFolder = CreateWindowExW(0, L"BUTTON", L"\xE710",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER,
-        18, 86, 32, 28, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_ADD)),
+        18, 130, 32, 28, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_ADD)),
         GetModuleHandleW(nullptr), nullptr);
     _newWorkspace = CreateWindowExW(0, L"BUTTON", L"\xE8A7",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER,
-        54, 86, 32, 28, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_NEW)),
+        54, 130, 32, 28, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_NEW)),
         GetModuleHandleW(nullptr), nullptr);
     _saveWorkspace = CreateWindowExW(0, L"BUTTON", L"\xE74E",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER,
-        90, 86, 32, 28, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_SAVE)),
+        90, 130, 32, 28, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_SAVE)),
         GetModuleHandleW(nullptr), nullptr);
     _openWorkspace = CreateWindowExW(0, L"BUTTON", L"\xE8B7",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER,
-        126, 86, 32, 28, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_OPEN)),
+        126, 130, 32, 28, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_OPEN)),
         GetModuleHandleW(nullptr), nullptr);
     _removeFolder = CreateWindowExW(0, L"BUTTON", L"\xE74D",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER,
-        162, 86, 32, 28, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_REMOVE)),
+        162, 130, 32, 28, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_REMOVE)),
         GetModuleHandleW(nullptr), nullptr);
     _expandAll = CreateWindowExW(0, L"BUTTON", L"\xE8A0",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER,
-        198, 86, 32, 28, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_EXPAND_ALL)),
+        198, 130, 32, 28, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_EXPAND_ALL)),
         GetModuleHandleW(nullptr), nullptr);
     _collapseAll = CreateWindowExW(0, L"BUTTON", L"\xE8A1",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER,
-        234, 86, 32, 28, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_COLLAPSE_ALL)),
+        234, 130, 32, 28, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_COLLAPSE_ALL)),
         GetModuleHandleW(nullptr), nullptr);
     _createContainer = CreateWindowExW(0, L"BUTTON", L"\xE8B8",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_CENTER,
-        270, 86, 32, 28, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_CREATE_CONTAINER)),
+        270, 130, 32, 28, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_CREATE_CONTAINER)),
         GetModuleHandleW(nullptr), nullptr);
 
     _tree = CreateWindowExW(WS_EX_CLIENTEDGE, WC_TREEVIEWW, L"",
         WS_CHILD | WS_VISIBLE | TVS_HASBUTTONS | TVS_HASLINES | TVS_LINESATROOT |
         TVS_SHOWSELALWAYS | TVS_INFOTIP,
-        10, 126, 410, 500, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_TREE)),
+        10, 170, 410, 500, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_TREE)),
         GetModuleHandleW(nullptr), nullptr);
 
     _results = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
         WS_CHILD | LVS_REPORT | LVS_SHOWSELALWAYS,
-        10, 126, 410, 500, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_RESULTS)),
+        10, 170, 410, 500, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_RESULTS)),
+        GetModuleHandleW(nullptr), nullptr);
+
+    _viewFolders = CreateWindowExW(0, L"BUTTON", L"Pastas",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTORADIOBUTTON | BS_PUSHLIKE,
+        10, 602, 200, 26, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_VIEW_FOLDERS)),
+        GetModuleHandleW(nullptr), nullptr);
+    _viewSearch = CreateWindowExW(0, L"BUTTON", L"Pesquisa",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTORADIOBUTTON | BS_PUSHLIKE,
+        220, 602, 200, 26, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_VIEW_SEARCH)),
         GetModuleHandleW(nullptr), nullptr);
 
     _status = CreateWindowExW(0, L"STATIC", L"Ctrl+B mostrar/ocultar  |  Ctrl+P pesquisar",
@@ -949,7 +1476,8 @@ void QuickOpen::createControls()
         10, 632, 410, 22, _window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_STATUS)),
         GetModuleHandleW(nullptr), nullptr);
 
-    for (HWND h : {_searchGroup, _workspaceGroup, _search, _searchScopeButton, _tree, _results,
+    for (HWND h : {_searchGroup, _workspaceGroup, _search, _runSearch, _contentSearchCheck, _searchProgressText,
+                   _cancelSearch, _searchScopeButton, _tree, _results, _viewFolders, _viewSearch,
                    _addFolder, _newWorkspace, _saveWorkspace, _openWorkspace, _removeFolder,
                    _expandAll, _collapseAll, _createContainer, _status})
         SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(_font), TRUE);
@@ -959,9 +1487,10 @@ void QuickOpen::createControls()
         SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(_symbolFont), TRUE);
 
     SendMessageW(_search, EM_SETCUEBANNER, TRUE,
-                 reinterpret_cast<LPARAM>(L"Pesquisar arquivos...  (use >texto para pesquisar dentro dos arquivos)"));
+                 reinterpret_cast<LPARAM>(L"Pesquisar arquivos..."));
 
     createTooltips();
+    updatePanelSwitcher();
 
     ListView_SetExtendedListViewStyle(_results, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
     LVCOLUMNW col{};
@@ -998,10 +1527,15 @@ void QuickOpen::createTooltips()
     addButtonTooltip(_saveWorkspace, L"Salvar o NPPWorkSpace atual (.worknpp)");
     addButtonTooltip(_openWorkspace, L"Abrir um arquivo .worknpp");
     addButtonTooltip(_removeFolder, L"Remover a pasta selecionada");
-    addButtonTooltip(_expandAll, L"Expandir todas as pastas");
-    addButtonTooltip(_collapseAll, L"Retrair todas as pastas");
+    addButtonTooltip(_expandAll, L"Expandir pastas ou grupos de pesquisa");
+    addButtonTooltip(_collapseAll, L"Retrair pastas ou grupos de pesquisa");
     addButtonTooltip(_createContainer, L"Criar contêiner de projeto");
+    addButtonTooltip(_runSearch, L"Executar pesquisa");
     addButtonTooltip(_searchScopeButton, L"Escolher contêineres e pastas incluídos na pesquisa");
+    addButtonTooltip(_contentSearchCheck, L"Quando marcado, pesquisa o conteúdo dos arquivos de texto suportados");
+    addButtonTooltip(_cancelSearch, L"Cancelar a pesquisa em conteúdo em andamento");
+    addButtonTooltip(_viewFolders, L"Mostrar pastas da Workspace sem limpar a pesquisa");
+    addButtonTooltip(_viewSearch, L"Voltar aos resultados preservados da pesquisa");
 }
 
 void QuickOpen::addButtonTooltip(HWND button, const wchar_t* text)
@@ -1078,29 +1612,35 @@ void QuickOpen::syncNativeFolderWorkspace()
 void QuickOpen::layoutControls(int width, int height)
 {
     if (!_window) return;
-    width = (std::max)(static_cast<int>(WORKSPACE_MIN_WIDTH),
-                       (std::min)(static_cast<int>(WORKSPACE_MAX_WIDTH), width));
-    const bool floating = isFloatingDockHost(_dockHost);
-    if (floating)
-        height = (std::max)(static_cast<int>(WORKSPACE_MIN_HEIGHT),
-                            (std::min)(static_cast<int>(WORKSPACE_MAX_HEIGHT), height));
+    width = (std::max)(static_cast<int>(WORKSPACE_MIN_WIDTH), width);
+    height = (std::max)(static_cast<int>(WORKSPACE_MIN_HEIGHT), height);
 
     const int pad = 8;
-    const int searchGroupH = 58;
-    const int workspaceGroupY = 64;
+    const int searchGroupH = 102;
+    const int workspaceGroupY = 108;
     const int workspaceGroupH = 58;
-    const int contentY = 128;
+    const int contentY = 172;
     const int statusH = 22;
-    const int contentH = (std::max)(60, height - contentY - statusH - 6);
+    const int switcherH = 28;
+    const int switcherY = height - statusH - switcherH - 8;
+    const int contentH = (std::max)(60, switcherY - contentY - 6);
 
     MoveWindow(_searchGroup, pad, 4, width - 2 * pad, searchGroupH, TRUE);
-    MoveWindow(_search, pad + 10, 24, (std::max)(120, width - 2 * pad - 88), 26, TRUE);
+    const int scopeButtonX = width - pad - 74;
+    const int runButtonX = scopeButtonX - 86;
+    MoveWindow(_search, pad + 10, 24, (std::max)(90, runButtonX - (pad + 10) - 6), 26, TRUE);
+    MoveWindow(_runSearch, runButtonX, 24, 80, 26, TRUE);
     MoveWindow(_searchScopeButton, width - pad - 74, 24, 64, 26, TRUE);
+    MoveWindow(_contentSearchCheck, pad + 10, 54, (std::max)(160, width - 2 * pad - 112), 22, TRUE);
+    MoveWindow(_cancelSearch, width - pad - 86, 52, 76, 24, TRUE);
+    MoveWindow(_searchProgress, pad + 10, 82, (std::max)(100, width / 3), 14, TRUE);
+    MoveWindow(_searchProgressText, pad + 20 + (std::max)(100, width / 3), 76,
+               (std::max)(120, width - 2 * pad - 30 - (std::max)(100, width / 3)), 24, TRUE);
     MoveWindow(_workspaceGroup, pad, workspaceGroupY, width - 2 * pad, workspaceGroupH, TRUE);
 
     constexpr int buttonSize = 32;
     constexpr int gap = 5;
-    const int buttonY = 82;
+    const int buttonY = 126;
     int x = pad + 10;
     HWND buttons[] = {_addFolder, _newWorkspace, _saveWorkspace, _openWorkspace, _removeFolder, _expandAll, _collapseAll, _createContainer};
     for (HWND button : buttons)
@@ -1111,7 +1651,48 @@ void QuickOpen::layoutControls(int width, int height)
 
     MoveWindow(_tree, pad, contentY, width - 2 * pad, contentH, TRUE);
     MoveWindow(_results, pad, contentY, width - 2 * pad, contentH, TRUE);
+    const int switcherW = width - 2 * pad;
+    const int half = (switcherW - 6) / 2;
+    MoveWindow(_viewFolders, pad, switcherY, half, switcherH, TRUE);
+    MoveWindow(_viewSearch, pad + half + 6, switcherY, switcherW - half - 6, switcherH, TRUE);
     MoveWindow(_status, pad, height - statusH - 2, width - 2 * pad, statusH, TRUE);
+    configureResultsColumns(_results, _searchInsideFiles && _searchOnly);
+}
+
+void QuickOpen::updatePanelSwitcher()
+{
+    setButtonChecked(_viewFolders, !_resultsViewVisible);
+    setButtonChecked(_viewSearch, _resultsViewVisible);
+    const bool hasSearch = _searchOnly || !_searchResults.empty() || _searchQueryRunning;
+    if (_viewSearch) EnableWindow(_viewSearch, hasSearch);
+}
+
+void QuickOpen::showFoldersPanel()
+{
+    _resultsViewVisible = false;
+    if (_results) ShowWindow(_results, SW_HIDE);
+    if (_tree) ShowWindow(_tree, SW_SHOW);
+    updatePanelSwitcher();
+    if (_tree) SetFocus(_tree);
+    if (_searchOnly && _status)
+        SetWindowTextW(_status, L"Pastas  •  resultados preservados em Pesquisa");
+}
+
+void QuickOpen::showResultsPanel()
+{
+    if (!_searchOnly && _searchResults.empty() && !_searchQueryRunning)
+    {
+        updatePanelSwitcher();
+        if (_status) SetWindowTextW(_status, L"Nenhuma pesquisa executada");
+        return;
+    }
+
+    _resultsViewVisible = true;
+    if (_tree) ShowWindow(_tree, SW_HIDE);
+    if (_results) ShowWindow(_results, SW_SHOW);
+    configureResultsColumns(_results, _searchInsideFiles && _searchOnly);
+    updatePanelSwitcher();
+    if (_results) SetFocus(_results);
 }
 
 void QuickOpen::toggleWorkspace()
@@ -1170,20 +1751,31 @@ void QuickOpen::createSearchPopup()
 
     _searchPopupEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_NOHIDESEL,
-        12, 38, 650, 30, _searchPopup, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_POPUP_SEARCH)),
+        12, 38, 558, 30, _searchPopup, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_POPUP_SEARCH)),
+        GetModuleHandleW(nullptr), nullptr);
+    _searchPopupRunSearch = CreateWindowExW(0, L"BUTTON", L"Pesquisar",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        576, 38, 86, 30, _searchPopup, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_POPUP_RUN_SEARCH)),
         GetModuleHandleW(nullptr), nullptr);
     _searchPopupScopeButton = CreateWindowExW(0, L"BUTTON", L"Escopo",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
         670, 38, 78, 30, _searchPopup, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_SEARCH_SCOPE)),
         GetModuleHandleW(nullptr), nullptr);
+    _searchPopupContentCheck = CreateWindowExW(0, L"BUTTON", L"Pesquisar dentro dos arquivos",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+        12, 72, 230, 22, _searchPopup, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_POPUP_CONTENT_SEARCH)),
+        GetModuleHandleW(nullptr), nullptr);
+    setButtonChecked(_searchPopupContentCheck, _searchInsideFiles);
     SendMessageW(_searchPopupEdit, WM_SETFONT, reinterpret_cast<WPARAM>(_font), TRUE);
+    SendMessageW(_searchPopupRunSearch, WM_SETFONT, reinterpret_cast<WPARAM>(_font), TRUE);
     SendMessageW(_searchPopupScopeButton, WM_SETFONT, reinterpret_cast<WPARAM>(_font), TRUE);
+    SendMessageW(_searchPopupContentCheck, WM_SETFONT, reinterpret_cast<WPARAM>(_font), TRUE);
     SendMessageW(_searchPopupEdit, EM_SETCUEBANNER, TRUE,
-                 reinterpret_cast<LPARAM>(L"Nome do arquivo/pasta ou >texto para pesquisar dentro dos arquivos..."));
+                 reinterpret_cast<LPARAM>(L"Nome do arquivo/pasta..."));
 
     _searchPopupResults = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
         WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SHOWSELALWAYS,
-        12, 78, 720, 310, _searchPopup, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_POPUP_RESULTS)),
+        12, 100, 720, 288, _searchPopup, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_POPUP_RESULTS)),
         GetModuleHandleW(nullptr), nullptr);
     SendMessageW(_searchPopupResults, WM_SETFONT, reinterpret_cast<WPARAM>(_font), TRUE);
     ListView_SetExtendedListViewStyle(_searchPopupResults, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
@@ -1200,10 +1792,10 @@ void QuickOpen::createSearchPopup()
     col.pszText = const_cast<LPWSTR>(L"Path completo");
     ListView_InsertColumn(_searchPopupResults, 2, &col);
 
-    HWND hint = CreateWindowExW(0, L"STATIC", L"Enter abrir  |  Esc fechar",
+    _searchPopupHint = CreateWindowExW(0, L"STATIC", L"Enter pesquisar  |  Na lista: Enter abrir  |  Esc fechar",
         WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
         12, 394, 300, 20, _searchPopup, nullptr, GetModuleHandleW(nullptr), nullptr);
-    SendMessageW(hint, WM_SETFONT, reinterpret_cast<WPARAM>(_font), TRUE);
+    SendMessageW(_searchPopupHint, WM_SETFONT, reinterpret_cast<WPARAM>(_font), TRUE);
 
     SendMessageW(_npp, NPPM_DARKMODESUBCLASSANDTHEME,
                  static_cast<WPARAM>(NppDarkMode::dmfInit), reinterpret_cast<LPARAM>(_searchPopup));
@@ -1219,9 +1811,15 @@ void QuickOpen::layoutSearchPopup()
     GetClientRect(_searchPopup, &rc);
     const int w = (std::max)(420, static_cast<int>(rc.right - rc.left));
     const int h = (std::max)(250, static_cast<int>(rc.bottom - rc.top));
-    MoveWindow(_searchPopupEdit, 12, 38, w - 110, 30, TRUE);
+    const int scopeButtonX = w - 90;
+    const int runButtonX = scopeButtonX - 94;
+    MoveWindow(_searchPopupEdit, 12, 38, (std::max)(140, runButtonX - 20), 30, TRUE);
+    MoveWindow(_searchPopupRunSearch, runButtonX, 38, 86, 30, TRUE);
     MoveWindow(_searchPopupScopeButton, w - 90, 38, 78, 30, TRUE);
-    MoveWindow(_searchPopupResults, 12, 78, w - 24, h - 118, TRUE);
+    MoveWindow(_searchPopupContentCheck, 12, 72, w - 24, 22, TRUE);
+    MoveWindow(_searchPopupResults, 12, 100, w - 24, h - 140, TRUE);
+    MoveWindow(_searchPopupHint, 12, h - 32, w - 24, 20, TRUE);
+    configureResultsColumns(_searchPopupResults, _searchInsideFiles);
 }
 
 void QuickOpen::showSearchPopup()
@@ -1235,6 +1833,11 @@ void QuickOpen::showSearchPopup()
     if (_searchPopupEdit) SetWindowTextW(_searchPopupEdit, L"");
     if (_searchPopupResults) ListView_DeleteAllItems(_searchPopupResults);
     _searchResults.clear();
+    _contentSearchGroups.clear();
+    _contentSearchGroupByPath.clear();
+    configureResultsColumns(_searchPopupResults, false);
+    if (_searchPopupContentCheck)
+        setButtonChecked(_searchPopupContentCheck, _searchInsideFiles);
     if (!_searchIndexValid && !_searchIndexBuilding)
         startSearchIndexBuild();
     layoutSearchPopup();
@@ -1252,7 +1855,7 @@ void QuickOpen::hideSearchPopup()
 {
     if (_searchPopup)
     {
-        KillTimer(_searchPopup, SEARCH_DEBOUNCE_TIMER);
+        if (_contentSearchPopup) cancelContentSearch();
         ShowWindow(_searchPopup, SW_HIDE);
     }
 }
@@ -1263,7 +1866,12 @@ void QuickOpen::updatePopupSearch()
     const std::wstring query = getWindowText(_searchPopupEdit);
     if (query.empty())
     {
+        if (_contentSearchPopup) cancelContentSearch();
+        _searchResults.clear();
+        _contentSearchGroups.clear();
+        _contentSearchGroupByPath.clear();
         ListView_DeleteAllItems(_searchPopupResults);
+        configureResultsColumns(_searchPopupResults, false);
         return;
     }
     showPopupSearchResults(query);
@@ -1272,14 +1880,10 @@ void QuickOpen::updatePopupSearch()
 
 void QuickOpen::startContentSearch(const std::wstring& query, bool popup)
 {
-    if (!_searchIndexSnapshot || query.size() < 2) return;
+    if (!isContentSearchEnabled(popup) || query.size() < 2 || !_window) return;
 
-    // Never join a running search on the UI thread. The previous implementation
-    // could block Notepad++ here for the entire duration of a workspace scan.
     if (_searchQueryRunning)
     {
-        // Cancel the current scan as soon as possible. The worker checks this
-        // generation between files; the UI thread never waits for it.
         _pendingContentQuery = query;
         _pendingContentPopup = popup;
         _searchQueryGeneration.fetch_add(1);
@@ -1292,110 +1896,633 @@ void QuickOpen::startContentSearch(const std::wstring& query, bool popup)
     const unsigned int generation = _searchQueryGeneration.fetch_add(1) + 1;
     _runningContentQuery = query;
     _runningContentPopup = popup;
-    const auto snapshot = _searchIndexSnapshot;
+    _contentSearchPopup = popup;
+    _contentSearchProcessed = 0;
+    _contentSearchTotal = 0;
+    _contentSearchHits = 0;
+
+    std::vector<std::filesystem::path> roots;
+    if (_searchIncludedPaths.empty())
+    {
+        roots = getWorkspaceRootsForPanel();
+    }
+    else
+    {
+        roots.reserve(_searchIncludedPaths.size());
+        for (const auto& included : _searchIncludedPaths)
+            roots.emplace_back(included);
+    }
+    const auto included = _searchIncludedPaths;
     const auto disabled = _searchDisabledPaths;
     const HWND target = _window;
+    const std::wstring queryLower = lowerText(query);
+    const bool asciiQuery = isAsciiString(query);
+    const std::string asciiNeedle = asciiQuery ? utf8FromWide(query) : std::string();
 
-    _searchQueryThread = std::thread([this, query, popup, generation, snapshot, disabled, target]()
+    EnableWindow(_cancelSearch, TRUE);
+    if (_searchProgress) SendMessageW(_searchProgress, PBM_SETPOS, 0, 0);
+    if (_searchProgressText) SetWindowTextW(_searchProgressText, L"Preparando pesquisa...");
+    if (popup && _searchPopupHint) SetWindowTextW(_searchPopupHint, L"Pesquisando...");
+
+    QO_DEBUG_LOG(L"Início da pesquisa em conteúdo");
+    QO_DEBUG_LOG(L"Filtro: " + query);
+
+    _searchQueryThread = std::thread([this, query, queryLower, asciiQuery, asciiNeedle,
+                                      roots, included, disabled, popup, generation, target]()
     {
-        auto* found = new std::vector<SearchResult>();
-        found->reserve(MAX_SEARCH_RESULTS);
+#ifdef _DEBUG
+        const auto started = std::chrono::steady_clock::now();
+#endif
+
+        struct FileJob
+        {
+            std::filesystem::path path;
+            std::wstring fileName;
+            std::wstring folder;
+            std::wstring relative;
+        };
+
+        std::deque<FileJob> jobs;
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::atomic<bool> enumerationDone{false};
+        std::atomic<size_t> total{0};
+        std::atomic<size_t> processed{0};
+        std::atomic<size_t> hits{0};
+
+        auto stillCurrent = [&]()
+        {
+            return _searchQueryGeneration.load() == generation;
+        };
 
         auto enabled = [&](const std::filesystem::path& path)
         {
-            if (disabled.empty()) return true;
-            std::error_code ec;
-            for (const auto& dstr : disabled)
-            {
-                const std::filesystem::path d(dstr);
-                auto rel = std::filesystem::relative(path, d, ec);
-                if (!ec && rel != L".." && rel.native().rfind(L"..\\", 0) != 0 && rel.native().rfind(L"../", 0) != 0)
-                    return false;
-                ec.clear();
-            }
-            return true;
+            return isPathEnabledForScope(path, included, disabled);
         };
 
-        const std::wstring needle = query.substr(1);
-        for (const auto& item : *snapshot)
+        auto postProgress = [&](const std::wstring& currentFile)
         {
-            if (_searchQueryGeneration.load() != generation)
-                break;
-            if (!enabled(item.path)) continue;
-            if (fileContainsText(item.path, needle))
+            if (!target) return;
+            auto* progress = new ContentSearchProgress();
+            progress->generation = generation;
+            progress->popup = popup;
+            progress->processed = processed.load();
+            progress->total = total.load();
+            progress->hits = hits.load();
+            progress->currentFile = currentFile;
+            if (!PostMessageW(target, WM_CONTENT_SEARCH_PROGRESS, 0, reinterpret_cast<LPARAM>(progress)))
+                delete progress;
+        };
+
+        auto postBatch = [&](std::vector<ContentFileGroup>& batch)
+        {
+            if (batch.empty() || !target) return;
+            auto* message = new ContentSearchBatch();
+            message->generation = generation;
+            message->popup = popup;
+            message->files.swap(batch);
+            if (!PostMessageW(target, WM_CONTENT_SEARCH_BATCH, 0, reinterpret_cast<LPARAM>(message)))
+                delete message;
+        };
+
+        auto makeJob = [](const std::filesystem::path& root, const std::filesystem::path& path)
+        {
+            FileJob job;
+            job.path = path;
+            job.fileName = path.filename().wstring();
+            if (job.fileName.empty()) job.fileName = path.wstring();
+
+            std::error_code relEc;
+            std::filesystem::path relPath = std::filesystem::relative(path, root, relEc);
+            if (relEc || relPath.empty()) relPath = path.filename();
+            job.relative = relPath.wstring();
+            std::filesystem::path folderPath = relPath.parent_path();
+            job.folder = folderPath.empty() ? L"\\" : L"\\" + folderPath.wstring();
+            std::replace(job.folder.begin(), job.folder.end(), L'/', L'\\');
+            return job;
+        };
+
+        auto scanFile = [&](const FileJob& job)
+        {
+            ContentFileGroup group;
+            group.path = job.path;
+            group.fileName = job.fileName;
+            group.folder = job.folder;
+            group.relative = job.relative;
+
+#ifdef _DEBUG
+            const auto fileStart = std::chrono::steady_clock::now();
+#endif
+            std::error_code ec;
+            const auto size = std::filesystem::file_size(job.path, ec);
+            if (ec || size == 0 || size > MAX_CONTENT_FILE_SIZE)
+                return group;
+
+            std::ifstream in(job.path, std::ios::binary);
+            if (!in) return group;
+
+            std::vector<unsigned char> bytes(static_cast<size_t>(size));
+            in.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+            const std::streamsize got = in.gcount();
+            if (got <= 0) return group;
+            bytes.resize(static_cast<size_t>(got));
+
+            if (asciiQuery && !hasUtf16Pattern(bytes) && !containsAsciiBytesInsensitive(bytes, asciiNeedle))
+                return group;
+
+            std::wstring text;
+            TextEncoding encoding = TextEncoding::Unknown;
+            if (!decodeTextBytes(bytes, text, encoding))
+                return group;
+
+            size_t lineNumber = 1;
+            size_t lineStart = 0;
+            while (lineStart <= text.size() && stillCurrent())
             {
-                found->push_back(item);
-                if (found->size() >= MAX_SEARCH_RESULTS) break;
+                size_t lineEnd = text.find(L'\n', lineStart);
+                if (lineEnd == std::wstring::npos) lineEnd = text.size();
+                size_t logicalEnd = lineEnd;
+                if (logicalEnd > lineStart && text[logicalEnd - 1] == L'\r')
+                    --logicalEnd;
+
+                std::wstring line = text.substr(lineStart, logicalEnd - lineStart);
+                std::wstring lineLower = lowerText(line);
+
+                size_t searchFrom = 0;
+                size_t occurrenceOnLine = 0;
+                while (stillCurrent())
+                {
+                    const size_t pos = lineLower.find(queryLower, searchFrom);
+                    if (pos == std::wstring::npos) break;
+
+                    const std::wstring matchText = line.substr(pos, (std::min)(query.size(), line.size() - pos));
+                    SnippetInfo snippet = makeSnippet(line, pos, matchText.size());
+                    group.matches.push_back({lineNumber, std::move(snippet.text), snippet.matchStart,
+                                             matchText.size(), occurrenceOnLine, matchText});
+                    searchFrom = pos + (std::max)(size_t(1), queryLower.size());
+                    ++occurrenceOnLine;
+                }
+
+                if (lineEnd == text.size()) break;
+                lineStart = lineEnd + 1;
+                ++lineNumber;
+            }
+
+#ifdef _DEBUG
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - fileStart).count();
+            QO_DEBUG_LOG(L"Arquivo: " + job.relative + L" | encoding=" + encodingName(encoding) +
+                         L" | tempo=" + std::to_wstring(elapsed) + L"ms | ocorrências=" +
+                         std::to_wstring(group.matches.size()));
+#endif
+            return group;
+        };
+
+        auto worker = [&]()
+        {
+            std::vector<ContentFileGroup> batch;
+            batch.reserve(CONTENT_BATCH_FILE_COUNT);
+
+            while (stillCurrent())
+            {
+                FileJob job;
+                {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    cv.wait(lock, [&]() { return !jobs.empty() || enumerationDone.load() || !stillCurrent(); });
+                    if (!stillCurrent()) break;
+                    if (jobs.empty())
+                    {
+                        if (enumerationDone.load()) break;
+                        continue;
+                    }
+                    job = std::move(jobs.front());
+                    jobs.pop_front();
+                    cv.notify_one();
+                }
+
+                postProgress(job.relative);
+                ContentFileGroup group = scanFile(job);
+                const size_t fileHits = group.matches.size();
+                if (fileHits > 0)
+                {
+                    hits.fetch_add(fileHits);
+                    batch.push_back(std::move(group));
+                    if (batch.size() >= CONTENT_BATCH_FILE_COUNT)
+                        postBatch(batch);
+                }
+                processed.fetch_add(1);
+                postProgress(job.relative);
+            }
+
+            if (stillCurrent())
+                postBatch(batch);
+        };
+
+        const unsigned int hardware = std::thread::hardware_concurrency();
+        const size_t requestedWorkers = static_cast<size_t>(hardware ? hardware : 2);
+        const size_t workerCount = (std::max)(size_t(1), (std::min)(size_t(4), requestedWorkers));
+        std::vector<std::thread> workers;
+        workers.reserve(workerCount);
+        for (size_t i = 0; i < workerCount; ++i)
+            workers.emplace_back(worker);
+
+        std::unordered_set<std::wstring> seen;
+        for (const auto& root : roots)
+        {
+            if (!stillCurrent()) break;
+            QO_DEBUG_LOG(L"Diretório: " + root.wstring());
+            std::error_code ec;
+            std::filesystem::recursive_directory_iterator it(
+                root, std::filesystem::directory_options::skip_permission_denied, ec);
+            for (; it != std::filesystem::recursive_directory_iterator{} && !ec && stillCurrent(); it.increment(ec))
+            {
+                const auto path = it->path();
+                std::error_code itemEc;
+                if (it->is_directory(itemEc))
+                {
+                    if (isHiddenSystemDirectory(path)) it.disable_recursion_pending();
+                    continue;
+                }
+                if (!it->is_regular_file(itemEc) || !isSupportedTextExtension(path) || !enabled(path))
+                    continue;
+
+                std::wstring key = lowerText(path.lexically_normal().wstring());
+                std::replace(key.begin(), key.end(), L'/', L'\\');
+                if (!seen.insert(key).second) continue;
+
+                FileJob job = makeJob(root, path);
+                {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    cv.wait(lock, [&]() { return jobs.size() < CONTENT_QUEUE_LIMIT || !stillCurrent(); });
+                    if (!stillCurrent()) break;
+                    jobs.push_back(std::move(job));
+                    total.fetch_add(1);
+                }
+                cv.notify_one();
             }
         }
 
+        enumerationDone = true;
+        cv.notify_all();
+        for (auto& thread : workers)
+            if (thread.joinable()) thread.join();
+
         _searchQueryRunning = false;
-        if (!target)
-        {
-            delete found;
-            return;
-        }
-        if (_searchQueryGeneration.load() != generation)
-        {
-            delete found;
-            PostMessageW(target, WM_SEARCH_INDEX_READY + 1, popup ? 1 : 0, 0);
-            return;
-        }
-        PostMessageW(target, WM_SEARCH_INDEX_READY + 1, popup ? 1 : 0,
-                     reinterpret_cast<LPARAM>(found));
+
+        auto* complete = new ContentSearchComplete();
+        complete->generation = generation;
+        complete->popup = popup;
+        complete->cancelled = _searchQueryGeneration.load() != generation;
+        complete->processed = processed.load();
+        complete->total = total.load();
+        complete->hits = hits.load();
+
+#ifdef _DEBUG
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        QO_DEBUG_LOG((complete->cancelled ? L"Pesquisa cancelada" : L"Pesquisa concluída") +
+                     (L" | arquivos=" + std::to_wstring(complete->processed) + L"/" +
+                      std::to_wstring(complete->total) + L" | ocorrências=" +
+                      std::to_wstring(complete->hits) + L" | tempo total=" +
+                      std::to_wstring(elapsed) + L"ms"));
+#endif
+
+        if (!target || !PostMessageW(target, WM_CONTENT_SEARCH_DONE, 0, reinterpret_cast<LPARAM>(complete)))
+            delete complete;
     });
 }
 
-void QuickOpen::finishContentSearch(std::vector<SearchResult>* found, bool popup)
+void QuickOpen::applyContentSearchBatch(ContentSearchBatch* batch)
 {
-    if (!found)
+    std::unique_ptr<ContentSearchBatch> holder(batch);
+    if (!holder || holder->generation != _searchQueryGeneration.load()) return;
+
+    HWND list = holder->popup ? _searchPopupResults : _results;
+    if (!list) return;
+
+    SendMessageW(list, WM_SETREDRAW, FALSE, 0);
+    for (auto& group : holder->files)
+        appendContentSearchGroup(std::move(group), list);
+    SendMessageW(list, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(list, nullptr, FALSE);
+
+    if (!_searchResults.empty() && ListView_GetSelectedCount(list) == 0)
+        ListView_SetItemState(list, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+}
+
+void QuickOpen::updateContentSearchProgress(ContentSearchProgress* progress)
+{
+    std::unique_ptr<ContentSearchProgress> holder(progress);
+    if (!holder || holder->generation != _searchQueryGeneration.load()) return;
+
+    _contentSearchProcessed = holder->processed;
+    _contentSearchTotal = holder->total;
+    _contentSearchHits = holder->hits;
+
+    const int percent = holder->total > 0
+        ? static_cast<int>((holder->processed * 100) / holder->total)
+        : 0;
+    if (_searchProgress) SendMessageW(_searchProgress, PBM_SETPOS, percent, 0);
+
+    std::wstring text = std::to_wstring(holder->processed) + L"/" +
+        std::to_wstring(holder->total) + L" (" + std::to_wstring(percent) + L"%)";
+    if (!holder->currentFile.empty())
+        text += L"  Pesquisando: " + holder->currentFile;
+    if (_searchProgressText) SetWindowTextW(_searchProgressText, text.c_str());
+
+    if (holder->popup && _searchPopupHint)
     {
-        HWND edit = popup ? _searchPopupEdit : _search;
-        const std::wstring current = edit ? getWindowText(edit) : L"";
-        if (!current.empty() && current.front() == L'>')
-            startContentSearch(current, popup);
+        std::wstring hint = std::to_wstring(holder->hits) + L" ocorrência(s)  |  " + text;
+        SetWindowTextW(_searchPopupHint, hint.c_str());
+    }
+    if (!holder->popup)
+    {
+        std::wstring status = std::to_wstring(holder->hits) + L" ocorrência(s) em " +
+            std::to_wstring(_contentSearchGroups.size()) + L" arquivo(s)";
+        SetWindowTextW(_status, status.c_str());
+    }
+}
+
+void QuickOpen::completeContentSearch(ContentSearchComplete* complete)
+{
+    std::unique_ptr<ContentSearchComplete> holder(complete);
+
+    if (!_pendingContentQuery.empty() && !_searchQueryRunning)
+    {
+        const std::wstring query = _pendingContentQuery;
+        const bool popup = _pendingContentPopup;
+        _pendingContentQuery.clear();
+        _pendingContentPopup = false;
+        resetContentSearchResults(popup);
+        startContentSearch(query, popup);
         return;
     }
-    std::unique_ptr<std::vector<SearchResult>> holder(found);
-    _searchResults = std::move(*holder);
-    ListView_DeleteAllItems(popup ? _searchPopupResults : _results);
+
+    if (!holder || holder->generation != _searchQueryGeneration.load())
+        return;
+
+    _contentSearchProcessed = holder->processed;
+    _contentSearchTotal = holder->total;
+    _contentSearchHits = holder->hits;
+    EnableWindow(_cancelSearch, FALSE);
+
+    const int percent = holder->total > 0
+        ? static_cast<int>((holder->processed * 100) / holder->total)
+        : 100;
+    if (_searchProgress) SendMessageW(_searchProgress, PBM_SETPOS, percent, 0);
+
+    std::wstring text = (holder->cancelled ? L"Pesquisa cancelada: " : L"Pesquisa concluída: ");
+    text += std::to_wstring(holder->processed) + L"/" + std::to_wstring(holder->total) +
+        L" arquivo(s), " + std::to_wstring(holder->hits) + L" ocorrência(s)";
+    if (_searchProgressText) SetWindowTextW(_searchProgressText, text.c_str());
+
+    if (holder->popup && _searchPopupHint)
+        SetWindowTextW(_searchPopupHint, text.c_str());
+    if (!holder->popup)
+        SetWindowTextW(_status, (text + L"  •  Enter abrir  •  Esc limpar pesquisa").c_str());
+}
+
+void QuickOpen::cancelContentSearch()
+{
+    _pendingContentQuery.clear();
+    _pendingContentPopup = false;
+    if (!_searchQueryRunning)
+    {
+        EnableWindow(_cancelSearch, FALSE);
+        return;
+    }
+
+    _searchQueryGeneration.fetch_add(1);
+    EnableWindow(_cancelSearch, FALSE);
+    if (_searchProgressText) SetWindowTextW(_searchProgressText, L"Pesquisa cancelada. Resultados preservados.");
+    if (_searchPopupHint) SetWindowTextW(_searchPopupHint, L"Pesquisa cancelada. Resultados preservados.");
+    SetWindowTextW(_status, L"Pesquisa cancelada. Resultados preservados.");
+    QO_DEBUG_LOG(L"Cancelamento solicitado");
+}
+
+bool QuickOpen::isContentSearchEnabled(bool /*popup*/) const
+{
+    return _searchInsideFiles;
+}
+
+void QuickOpen::setContentSearchEnabled(bool enabled)
+{
+    if (_searchInsideFiles == enabled)
+    {
+        setButtonChecked(_contentSearchCheck, enabled);
+        setButtonChecked(_searchPopupContentCheck, enabled);
+        return;
+    }
+
+    _searchInsideFiles = enabled;
+    setButtonChecked(_contentSearchCheck, enabled);
+    setButtonChecked(_searchPopupContentCheck, enabled);
+    _runSearchAfterIndexBuild = false;
+    _runSearchAfterIndexPopup = false;
+
+    cancelContentSearch();
+    _searchResults.clear();
+    _contentSearchGroups.clear();
+    _contentSearchGroupByPath.clear();
+
+    if (_results)
+    {
+        configureResultsColumns(_results, enabled);
+        ListView_DeleteAllItems(_results);
+    }
+    if (_searchPopupResults)
+    {
+        configureResultsColumns(_searchPopupResults, enabled);
+        ListView_DeleteAllItems(_searchPopupResults);
+    }
+
+    if (_searchProgress) SendMessageW(_searchProgress, PBM_SETPOS, 0, 0);
+    if (_searchProgressText) SetWindowTextW(_searchProgressText, L"Pressione Pesquisar ou Enter");
+    if (_searchPopupHint) SetWindowTextW(_searchPopupHint, L"Enter pesquisar  |  Na lista: Enter abrir  |  Esc fechar");
+    if (_searchOnly) SetWindowTextW(_status, L"Modo de pesquisa alterado. Pressione Pesquisar ou Enter.");
+}
+
+void QuickOpen::resetContentSearchResults(bool popup)
+{
     HWND list = popup ? _searchPopupResults : _results;
     if (!list) return;
-    for (size_t i = 0; i < _searchResults.size(); ++i)
-    {
-        LVITEMW item{}; item.mask = LVIF_TEXT; item.iItem = static_cast<int>(i);
-        item.pszText = const_cast<LPWSTR>(_searchResults[i].fileName.c_str());
-        ListView_InsertItem(list, &item);
-        ListView_SetItemText(list, static_cast<int>(i), 1, const_cast<LPWSTR>(_searchResults[i].folder.c_str()));
-        const std::wstring fullPath = _searchResults[i].path.wstring();
-        ListView_SetItemText(list, static_cast<int>(i), 2, const_cast<LPWSTR>(fullPath.c_str()));
-    }
-    if (!popup)
-    {
-        _searchOnly = true;
-        ShowWindow(_tree, SW_HIDE); ShowWindow(_results, SW_SHOW);
-        SetWindowTextW(_status, (std::to_wstring(_searchResults.size()) + L" resultado(s)  •  Enter abrir  •  Esc limpar pesquisa").c_str());
-    }
-    if (!_searchResults.empty()) ListView_SetItemState(list, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
 
-    HWND edit = popup ? _searchPopupEdit : _search;
-    const std::wstring current = getWindowText(edit);
-    if (!current.empty() && current.front() == L'>' && current != _runningContentQuery)
-        startContentSearch(current, popup);
+    _contentSearchGroups.clear();
+    _contentSearchGroupByPath.clear();
+    _searchResults.clear();
+    configureResultsColumns(list, true);
+    ListView_DeleteAllItems(list);
+    if (_searchProgress) SendMessageW(_searchProgress, PBM_SETPOS, 0, 0);
+    if (_searchProgressText) SetWindowTextW(_searchProgressText, L"Preparando pesquisa...");
+    if (popup && _searchPopupHint) SetWindowTextW(_searchPopupHint, L"Pesquisando...");
+}
+
+void QuickOpen::configureResultsColumns(HWND list, bool contentMode)
+{
+    if (!list) return;
+
+    RECT rc{};
+    GetClientRect(list, &rc);
+    const int available = (std::max)(320, static_cast<int>(rc.right - rc.left) - GetSystemMetrics(SM_CXVSCROLL) - 8);
+    const int firstWidth = contentMode ? (std::max)(170, available * 28 / 100)
+                                       : (std::max)(180, available * 25 / 100);
+    const int secondWidth = contentMode ? (std::max)(82, available * 14 / 100)
+                                        : (std::max)(170, available * 28 / 100);
+    const int thirdWidth = (std::max)(160, available - firstWidth - secondWidth);
+
+    LVCOLUMNW col{};
+    col.mask = LVCF_TEXT | LVCF_WIDTH;
+    col.cx = firstWidth;
+    col.pszText = const_cast<LPWSTR>(contentMode ? L"Arquivo / linha" : L"Arquivo");
+    ListView_SetColumn(list, 0, &col);
+    col.cx = secondWidth;
+    col.pszText = const_cast<LPWSTR>(contentMode ? L"Linha" : L"Pasta");
+    ListView_SetColumn(list, 1, &col);
+    col.cx = thirdWidth;
+    col.pszText = const_cast<LPWSTR>(contentMode ? L"Trecho / path" : L"Path completo");
+    ListView_SetColumn(list, 2, &col);
+}
+
+void QuickOpen::appendContentSearchGroup(ContentFileGroup&& group, HWND list)
+{
+    if (group.matches.empty()) return;
+
+    std::wstring key = lowerText(group.path.lexically_normal().wstring());
+    std::replace(key.begin(), key.end(), L'/', L'\\');
+    if (auto it = _contentSearchGroupByPath.find(key); it != _contentSearchGroupByPath.end())
+    {
+        auto& existing = _contentSearchGroups[it->second];
+        existing.matches.insert(existing.matches.end(),
+                                std::make_move_iterator(group.matches.begin()),
+                                std::make_move_iterator(group.matches.end()));
+        rebuildContentResultsList(list);
+        return;
+    }
+
+    const size_t groupIndex = _contentSearchGroups.size();
+    _contentSearchGroupByPath[key] = groupIndex;
+    _contentSearchGroups.push_back(std::move(group));
+
+    auto appendRow = [&](const SearchResult& result)
+    {
+        const int row = static_cast<int>(_searchResults.size());
+        _searchResults.push_back(result);
+        LVITEMW item{};
+        item.mask = LVIF_TEXT;
+        item.iItem = row;
+        std::wstring col0;
+        std::wstring col1;
+        std::wstring col2;
+        const SearchResult& visible = _searchResults.back();
+        if (visible.rowType == SearchResult::RowType::ContentFile)
+        {
+            col0 = (visible.contentFileIndex < _contentSearchGroups.size() &&
+                    _contentSearchGroups[visible.contentFileIndex].collapsed ? L"[+] " : L"[-] ") +
+                visible.fileName + L" (" + std::to_wstring(visible.lineNumber) + L")";
+            col1 = visible.folder;
+            col2 = visible.path.wstring();
+        }
+        else
+        {
+            col0 = L"    Linha " + std::to_wstring(visible.lineNumber);
+            col1 = std::to_wstring(visible.lineNumber);
+            col2 = visible.snippet;
+        }
+        item.pszText = const_cast<LPWSTR>(col0.c_str());
+        ListView_InsertItem(list, &item);
+        ListView_SetItemText(list, row, 1, const_cast<LPWSTR>(col1.c_str()));
+        ListView_SetItemText(list, row, 2, const_cast<LPWSTR>(col2.c_str()));
+    };
+
+    const auto& stored = _contentSearchGroups.back();
+    SearchResult header{};
+    header.path = stored.path;
+    header.fileName = stored.fileName;
+    header.folder = stored.folder;
+    header.relative = stored.relative;
+    header.rowType = SearchResult::RowType::ContentFile;
+    header.contentFileIndex = groupIndex;
+    header.lineNumber = stored.matches.size();
+    appendRow(header);
+
+    if (!stored.collapsed)
+    {
+        for (size_t i = 0; i < stored.matches.size(); ++i)
+        {
+            const auto& match = stored.matches[i];
+            SearchResult line{};
+            line.path = stored.path;
+            line.fileName = stored.fileName;
+            line.folder = stored.folder;
+            line.relative = stored.relative;
+            line.rowType = SearchResult::RowType::ContentLine;
+            line.contentFileIndex = groupIndex;
+            line.contentMatchIndex = i;
+            line.lineNumber = match.lineNumber;
+            line.snippet = match.snippet;
+            line.matchStart = match.matchStart;
+            line.matchLength = match.matchLength;
+            line.occurrenceOnLine = match.occurrenceOnLine;
+            line.matchText = match.matchText;
+            appendRow(line);
+        }
+    }
+}
+
+void QuickOpen::rebuildContentResultsList(HWND list)
+{
+    if (!list) return;
+
+    std::vector<ContentFileGroup> groups = std::move(_contentSearchGroups);
+    _contentSearchGroups.clear();
+    _contentSearchGroupByPath.clear();
+    _searchResults.clear();
+    ListView_DeleteAllItems(list);
+
+    for (auto& group : groups)
+        appendContentSearchGroup(std::move(group), list);
+}
+
+void QuickOpen::toggleContentGroupFromRow(HWND list, int row)
+{
+    if (row < 0 || row >= static_cast<int>(_searchResults.size())) return;
+    const SearchResult& result = _searchResults[static_cast<size_t>(row)];
+    if (result.rowType != SearchResult::RowType::ContentFile ||
+        result.contentFileIndex >= _contentSearchGroups.size())
+        return;
+
+    _contentSearchGroups[result.contentFileIndex].collapsed =
+        !_contentSearchGroups[result.contentFileIndex].collapsed;
+    SendMessageW(list, WM_SETREDRAW, FALSE, 0);
+    rebuildContentResultsList(list);
+    SendMessageW(list, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(list, nullptr, FALSE);
 }
 
 void QuickOpen::showPopupSearchResults(const std::wstring& query)
 {
-    if (!_searchIndexValid)
+    if (isContentSearchEnabled(true))
     {
-        if (!_searchIndexBuilding) startSearchIndexBuild();
-        SetWindowTextW(_status, L"Indexando arquivos... aguarde");
+        resetContentSearchResults(true);
+        if (query.size() < 2)
+        {
+            cancelContentSearch();
+            if (_searchPopupHint) SetWindowTextW(_searchPopupHint, L"Digite ao menos 2 caracteres");
+            return;
+        }
+        startContentSearch(query, true);
         return;
     }
 
-    if (!query.empty() && query.front() == L'>')
+    cancelContentSearch();
+    configureResultsColumns(_searchPopupResults, false);
+
+    if (!_searchIndexValid)
     {
-        startContentSearch(query, true);
+        if (!_searchIndexBuilding) startSearchIndexBuild();
+        _runSearchAfterIndexBuild = true;
+        _runSearchAfterIndexPopup = true;
+        SetWindowTextW(_status, L"Indexando arquivos... aguarde");
         return;
     }
 
@@ -1449,8 +2576,7 @@ void QuickOpen::openPopupSearchResult()
 {
     const int row = ListView_GetNextItem(_searchPopupResults, -1, LVNI_SELECTED);
     if (row < 0 || row >= static_cast<int>(_searchResults.size())) return;
-    const std::wstring path = _searchResults[static_cast<size_t>(row)].path.wstring();
-    SendMessageW(_npp, NPPM_DOOPEN, 0, reinterpret_cast<LPARAM>(path.c_str()));
+    openSearchResultRow(_searchResults[static_cast<size_t>(row)]);
     hideSearchPopup();
 }
 
@@ -1468,6 +2594,17 @@ void QuickOpen::refreshWorkspace()
 
 void QuickOpen::clearTreeData()
 {
+    if (_tree)
+    {
+        for (const auto& entry : _nodeData)
+        {
+            TVITEMW tv{};
+            tv.mask = TVIF_PARAM;
+            tv.hItem = entry.first;
+            if (TreeView_GetItem(_tree, &tv) && tv.lParam && tv.lParam != ID_NODE_DUMMY)
+                delete reinterpret_cast<NodeData*>(tv.lParam);
+        }
+    }
     _selectedTreeFiles.clear();
     _nodeData.clear();
 }
@@ -1489,8 +2626,7 @@ void QuickOpen::rebuildWorkspaceTree(bool /*preserveExpansion*/)
         addRootToTree(root, false);
 
     _searchOnly = false;
-    ShowWindow(_tree, SW_SHOW);
-    ShowWindow(_results, SW_HIDE);
+    showFoldersPanel();
 
     std::wstring status = L"NPPWorkSpace  •  " + std::to_wstring(_containers.size()) + L" projeto(s)  •  " + std::to_wstring(_savedRoots.size()) + L" pasta(s)  •  Ctrl+B mostrar/ocultar  •  Ctrl+P pesquisar";
     SetWindowTextW(_status, status.c_str());
@@ -1536,16 +2672,26 @@ void QuickOpen::addNode(HWND tree, HTREEITEM parent, const std::wstring& label,
                         const std::filesystem::path& path, NodeType type,
                         bool fromNppWorkspace, bool hasChildren, size_t containerIndex)
 {
+    NodeData node{};
+    node.type = type;
+    node.path = path;
+    node.fromNppWorkspace = fromNppWorkspace;
+    node.containerIndex = containerIndex;
+    node.label = label;
+    node.hasChildren = hasChildren;
+
+    const std::wstring displayLabel = formatTreeNodeLabel(node, false);
+
     TVINSERTSTRUCTW ins{};
     ins.hParent = parent;
     ins.hInsertAfter = TVI_LAST;
     ins.item.mask = TVIF_TEXT | TVIF_PARAM;
-    ins.item.pszText = const_cast<LPWSTR>(label.c_str());
+    ins.item.pszText = const_cast<LPWSTR>(displayLabel.c_str());
 
-    auto* data = new NodeData{type, path, fromNppWorkspace, containerIndex};
+    auto* data = new NodeData(node);
     ins.item.lParam = reinterpret_cast<LPARAM>(data);
     HTREEITEM item = TreeView_InsertItem(tree, &ins);
-    _nodeData[item] = *data;
+    _nodeData[item] = node;
 
     if (hasChildren)
     {
@@ -1557,6 +2703,27 @@ void QuickOpen::addNode(HWND tree, HTREEITEM parent, const std::wstring& label,
         dummy.item.lParam = ID_NODE_DUMMY;
         TreeView_InsertItem(tree, &dummy);
     }
+}
+
+std::wstring QuickOpen::formatTreeNodeLabel(const NodeData& data, bool expanded) const
+{
+    if (data.type == NodeType::File || !data.hasChildren)
+        return data.label;
+    return std::wstring(expanded ? L"[-] " : L"[+] ") + data.label;
+}
+
+void QuickOpen::refreshTreeNodeLabel(HTREEITEM item, bool expanded)
+{
+    if (!_tree || !item) return;
+    auto it = _nodeData.find(item);
+    if (it == _nodeData.end()) return;
+
+    std::wstring label = formatTreeNodeLabel(it->second, expanded);
+    TVITEMW tv{};
+    tv.mask = TVIF_TEXT;
+    tv.hItem = item;
+    tv.pszText = label.data();
+    TreeView_SetItem(_tree, &tv);
 }
 
 void QuickOpen::expandNode(HTREEITEM item)
@@ -1723,7 +2890,9 @@ void QuickOpen::openTreeSelection()
         stateItem.stateMask = TVIS_EXPANDED;
         stateItem.hItem = item;
         TreeView_GetItem(_tree, &stateItem);
-        TreeView_Expand(_tree, item, (stateItem.state & TVIS_EXPANDED) ? TVE_COLLAPSE : TVE_EXPAND);
+        const bool expanding = (stateItem.state & TVIS_EXPANDED) == 0;
+        TreeView_Expand(_tree, item, expanding ? TVE_EXPAND : TVE_COLLAPSE);
+        refreshTreeNodeLabel(item, expanding);
     }
 }
 
@@ -1755,11 +2924,193 @@ void QuickOpen::openSelectedResults(HWND list, bool closePopup)
 
     for (size_t index : indexes)
     {
-        const std::wstring path = _searchResults[index].path.wstring();
-        SendMessageW(_npp, NPPM_DOOPEN, 0, reinterpret_cast<LPARAM>(path.c_str()));
+        openSearchResultRow(_searchResults[index]);
     }
 
     if (closePopup) hideSearchPopup();
+}
+
+void QuickOpen::openSearchResultRow(const SearchResult& result)
+{
+    if (result.rowType == SearchResult::RowType::ContentLine)
+    {
+        openFileAtOccurrence(result);
+        return;
+    }
+
+    const std::wstring path = result.path.wstring();
+    SendMessageW(_npp, NPPM_DOOPEN, 0, reinterpret_cast<LPARAM>(path.c_str()));
+}
+
+void QuickOpen::openFileAtOccurrence(const SearchResult& result)
+{
+    const std::wstring path = result.path.wstring();
+    SendMessageW(_npp, NPPM_DOOPEN, 0, reinterpret_cast<LPARAM>(path.c_str()));
+
+    HWND scintilla = NPPWorkSpace_GetCurrentScintillaHandle();
+    if (!scintilla || result.lineNumber == 0) return;
+
+    const WPARAM line = static_cast<WPARAM>(result.lineNumber - 1);
+    const LRESULT lineStart = SendMessageW(scintilla, SCI_POSITIONFROMLINE, line, 0);
+    const LRESULT lineEnd = SendMessageW(scintilla, SCI_GETLINEENDPOSITION, line, 0);
+    if (lineStart < 0 || lineEnd < lineStart) return;
+
+    SendMessageW(scintilla, SCI_SETVISIBLEPOLICY, CARET_EVEN | CARET_JUMPS, 0);
+    SendMessageW(scintilla, SCI_ENSUREVISIBLEENFORCEPOLICY, line, 0);
+    SendMessageW(scintilla, SCI_SETSEARCHFLAGS, 0, 0);
+
+    auto bytesFromWide = [](const std::wstring& value, UINT codePage)
+    {
+        std::string bytes;
+        if (value.empty()) return bytes;
+        int needed = WideCharToMultiByte(codePage, 0, value.data(), static_cast<int>(value.size()),
+                                         nullptr, 0, nullptr, nullptr);
+        if (needed <= 0) return bytes;
+        bytes.assign(static_cast<size_t>(needed), '\0');
+        WideCharToMultiByte(codePage, 0, value.data(), static_cast<int>(value.size()),
+                            bytes.data(), needed, nullptr, nullptr);
+        return bytes;
+    };
+
+    auto findOccurrence = [&](const std::string& needle, LRESULT& foundStart, LRESULT& foundEnd)
+    {
+        if (needle.empty()) return false;
+        LRESULT searchStart = lineStart;
+        for (size_t occurrence = 0; occurrence <= result.occurrenceOnLine; ++occurrence)
+        {
+            SendMessageW(scintilla, SCI_SETTARGETSTART, static_cast<WPARAM>(searchStart), 0);
+            SendMessageW(scintilla, SCI_SETTARGETEND, static_cast<WPARAM>(lineEnd), 0);
+            const LRESULT pos = SendMessageA(scintilla, SCI_SEARCHINTARGET,
+                                             static_cast<WPARAM>(needle.size()),
+                                             reinterpret_cast<LPARAM>(needle.data()));
+            if (pos < 0) return false;
+            foundStart = pos;
+            foundEnd = SendMessageW(scintilla, SCI_GETTARGETEND, 0, 0);
+            searchStart = foundEnd > pos ? foundEnd : pos + 1;
+        }
+        return foundStart >= 0 && foundEnd >= foundStart;
+    };
+
+    LRESULT foundStart = -1;
+    LRESULT foundEnd = -1;
+    const std::wstring needle = result.matchText.empty() ? result.snippet : result.matchText;
+    const UINT scintillaCodePage = static_cast<UINT>(SendMessageW(scintilla, SCI_GETCODEPAGE, 0, 0));
+
+    std::vector<std::string> candidates;
+    candidates.push_back(utf8FromWide(needle));
+    if (scintillaCodePage != CP_UTF8)
+    {
+        std::string cpBytes = bytesFromWide(needle, scintillaCodePage ? scintillaCodePage : CP_ACP);
+        if (!cpBytes.empty() && cpBytes != candidates.front())
+            candidates.push_back(std::move(cpBytes));
+    }
+    std::string acpBytes = bytesFromWide(needle, CP_ACP);
+    if (!acpBytes.empty() && std::find(candidates.begin(), candidates.end(), acpBytes) == candidates.end())
+        candidates.push_back(std::move(acpBytes));
+
+    for (const auto& candidate : candidates)
+    {
+        if (findOccurrence(candidate, foundStart, foundEnd))
+            break;
+    }
+
+    if (foundStart >= 0 && foundEnd >= foundStart)
+    {
+        SendMessageW(scintilla, SCI_GOTOPOS, static_cast<WPARAM>(foundEnd), 0);
+        SendMessageW(scintilla, SCI_SETANCHOR, static_cast<WPARAM>(foundStart), 0);
+    }
+    else
+    {
+        SendMessageW(scintilla, SCI_GOTOPOS, static_cast<WPARAM>(lineStart), 0);
+        SendMessageW(scintilla, SCI_SETANCHOR, static_cast<WPARAM>(lineStart), 0);
+    }
+    SendMessageW(scintilla, SCI_SCROLLCARET, 0, 0);
+}
+
+LRESULT QuickOpen::handleResultsCustomDraw(HWND list, NMLVCUSTOMDRAW* customDraw)
+{
+    if (!customDraw) return CDRF_DODEFAULT;
+
+    const DWORD stage = customDraw->nmcd.dwDrawStage;
+    if (stage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+    if (stage == CDDS_ITEMPREPAINT) return CDRF_NOTIFYSUBITEMDRAW;
+    if (stage == (CDDS_ITEMPREPAINT | CDDS_SUBITEM))
+    {
+        const int row = static_cast<int>(customDraw->nmcd.dwItemSpec);
+        if (row >= 0 && row < static_cast<int>(_searchResults.size()))
+        {
+            const auto& result = _searchResults[static_cast<size_t>(row)];
+            if (result.rowType == SearchResult::RowType::ContentLine && customDraw->iSubItem == 2)
+            {
+                drawHighlightedSnippet(list, customDraw, result);
+                return CDRF_SKIPDEFAULT;
+            }
+        }
+    }
+    return CDRF_DODEFAULT;
+}
+
+void QuickOpen::drawHighlightedSnippet(HWND list, NMLVCUSTOMDRAW* customDraw, const SearchResult& result)
+{
+    const int row = static_cast<int>(customDraw->nmcd.dwItemSpec);
+    RECT rc{};
+    if (!ListView_GetSubItemRect(list, row, 2, LVIR_BOUNDS, &rc)) return;
+
+    HDC dc = customDraw->nmcd.hdc;
+    const bool selected = (ListView_GetItemState(list, row, LVIS_SELECTED) & LVIS_SELECTED) != 0;
+    const COLORREF background = selected ? GetSysColor(COLOR_HIGHLIGHT) : ListView_GetBkColor(list);
+    const COLORREF textColor = selected ? GetSysColor(COLOR_HIGHLIGHTTEXT) : ListView_GetTextColor(list);
+    const COLORREF matchBackground = _darkMode ? RGB(92, 76, 0) : RGB(255, 236, 120);
+    const COLORREF matchText = _darkMode ? RGB(255, 255, 255) : RGB(0, 0, 0);
+
+    HBRUSH backgroundBrush = CreateSolidBrush(background);
+    FillRect(dc, &rc, backgroundBrush);
+    DeleteObject(backgroundBrush);
+
+    const int saved = SaveDC(dc);
+    IntersectClipRect(dc, rc.left, rc.top, rc.right, rc.bottom);
+    SetBkMode(dc, TRANSPARENT);
+    SelectObject(dc, _font);
+
+    TEXTMETRICW tm{};
+    GetTextMetricsW(dc, &tm);
+    const int y = rc.top + ((rc.bottom - rc.top) - tm.tmHeight) / 2;
+    int x = rc.left + 4;
+
+    const size_t safeStart = (std::min)(result.matchStart, result.snippet.size());
+    const size_t safeLength = (std::min)(result.matchLength, result.snippet.size() - safeStart);
+    const std::wstring prefix = result.snippet.substr(0, safeStart);
+    const std::wstring match = result.snippet.substr(safeStart, safeLength);
+    const std::wstring suffix = result.snippet.substr(safeStart + safeLength);
+
+    auto textWidth = [&](const std::wstring& text)
+    {
+        SIZE size{};
+        if (!text.empty()) GetTextExtentPoint32W(dc, text.c_str(), static_cast<int>(text.size()), &size);
+        return size.cx;
+    };
+
+    auto drawText = [&](const std::wstring& text, COLORREF color)
+    {
+        if (text.empty()) return;
+        SetTextColor(dc, color);
+        ExtTextOutW(dc, x, y, ETO_CLIPPED, &rc, text.c_str(), static_cast<UINT>(text.size()), nullptr);
+        x += textWidth(text);
+    };
+
+    drawText(prefix, textColor);
+    if (!match.empty())
+    {
+        const int width = textWidth(match);
+        RECT matchRect{x, rc.top + 2, (std::min)(x + width, static_cast<int>(rc.right)), rc.bottom - 2};
+        HBRUSH matchBrush = CreateSolidBrush(matchBackground);
+        FillRect(dc, &matchRect, matchBrush);
+        DeleteObject(matchBrush);
+        drawText(match, matchText);
+    }
+    drawText(suffix, textColor);
+
+    RestoreDC(dc, saved);
 }
 
 void QuickOpen::showTreeContextMenu(HTREEITEM item, POINT screenPoint)
@@ -1784,6 +3135,7 @@ void QuickOpen::showTreeContextMenu(HTREEITEM item, POINT screenPoint)
         AppendMenuW(menu, MF_STRING, ID_ADD, L"Adicionar pasta ao projeto");
         AppendMenuW(menu, MF_STRING, ID_REMOVE, L"Excluir contêiner");
         AppendMenuW(menu, MF_STRING, ID_CREATE_CONTAINER + 1, L"Renomear contêiner");
+        AppendMenuW(menu, MF_STRING, ID_CONTAINER_COLOR, L"Alterar cor do contêiner...");
     }
     else if (isRoot)
     {
@@ -1803,6 +3155,7 @@ void QuickOpen::showTreeContextMenu(HTREEITEM item, POINT screenPoint)
     if (command == ID_ADD && isContainer) { addFolder(); return; }
     if (command == ID_REMOVE && (isContainer || isRoot)) { removeSelectedRoot(); return; }
     if (command == ID_CREATE_CONTAINER + 1 && isContainer) { renameContainer(it->second.containerIndex); return; }
+    if (command == ID_CONTAINER_COLOR && isContainer) { colorContainer(it->second.containerIndex); return; }
     if (command == ID_CREATE_CONTAINER + 2 && isRoot)
     {
         HMENU sub = CreatePopupMenu();
@@ -1838,6 +3191,7 @@ void QuickOpen::expandAllFolders()
             {
                 expandNode(current);
                 TreeView_Expand(_tree, current, TVE_EXPAND);
+                refreshTreeNodeLabel(current, true);
                 expand(TreeView_GetChild(_tree, current));
             }
         }
@@ -1857,10 +3211,35 @@ void QuickOpen::collapseAllFolders()
             {
                 collapse(child);
                 TreeView_Expand(_tree, current, TVE_COLLAPSE);
+                refreshTreeNodeLabel(current, false);
             }
         }
     };
     collapse(TreeView_GetRoot(_tree));
+}
+
+void QuickOpen::expandAllContentGroups()
+{
+    if (!_results || _contentSearchGroups.empty()) return;
+    for (auto& group : _contentSearchGroups)
+        group.collapsed = false;
+
+    SendMessageW(_results, WM_SETREDRAW, FALSE, 0);
+    rebuildContentResultsList(_results);
+    SendMessageW(_results, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(_results, nullptr, FALSE);
+}
+
+void QuickOpen::collapseAllContentGroups()
+{
+    if (!_results || _contentSearchGroups.empty()) return;
+    for (auto& group : _contentSearchGroups)
+        group.collapsed = true;
+
+    SendMessageW(_results, WM_SETREDRAW, FALSE, 0);
+    rebuildContentResultsList(_results);
+    SendMessageW(_results, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(_results, nullptr, FALSE);
 }
 
 void QuickOpen::handleTreeDoubleClick(LPNMTREEVIEWW tv)
@@ -1891,7 +3270,16 @@ void QuickOpen::handleTreeDoubleClick(LPNMTREEVIEWW tv)
 
 void QuickOpen::handleTreeItemExpanding(LPNMTREEVIEWW tv)
 {
-    if (tv && tv->action == TVE_EXPAND) expandNode(tv->itemNew.hItem);
+    if (!tv) return;
+    if (tv->action == TVE_EXPAND)
+    {
+        expandNode(tv->itemNew.hItem);
+        refreshTreeNodeLabel(tv->itemNew.hItem, true);
+    }
+    else if (tv->action == TVE_COLLAPSE)
+    {
+        refreshTreeNodeLabel(tv->itemNew.hItem, false);
+    }
 }
 
 HWND QuickOpen::findFolderWorkspaceTree() const
@@ -2022,22 +3410,7 @@ int QuickOpen::fuzzyScoreLower(const std::wstring& q, const std::wstring& c)
 
 bool QuickOpen::isSearchPathEnabled(const std::filesystem::path& path) const
 {
-    if (_searchDisabledPaths.empty()) return true;
-
-    std::wstring value = lower(path.wstring());
-    std::replace(value.begin(), value.end(), L'/', L'\\');
-    if (!value.empty() && value.back() != L'\\') value.push_back(L'\\');
-
-    for (const auto& disabled : _searchDisabledPaths)
-    {
-        std::wstring prefix = lower(disabled);
-        std::replace(prefix.begin(), prefix.end(), L'/', L'\\');
-        if (!prefix.empty() && prefix.back() != L'\\') prefix.push_back(L'\\');
-        if (value.size() >= prefix.size() &&
-            value.compare(0, prefix.size(), prefix) == 0)
-            return false;
-    }
-    return true;
+    return isPathEnabledForScope(path, _searchIncludedPaths, _searchDisabledPaths);
 }
 
 void QuickOpen::invalidateSearchIndex()
@@ -2116,8 +3489,14 @@ void QuickOpen::finishSearchIndexBuild(std::vector<SearchResult>* built)
     _searchIndex = std::move(*holder);
     _searchIndexSnapshot = std::make_shared<const std::vector<SearchResult>>(_searchIndex);
     _searchIndexValid = true;
-    if (_searchOnly) updateSearch();
-    if (_searchPopup && IsWindowVisible(_searchPopup)) updatePopupSearch();
+    if (_runSearchAfterIndexBuild)
+    {
+        const bool popup = _runSearchAfterIndexPopup;
+        _runSearchAfterIndexBuild = false;
+        _runSearchAfterIndexPopup = false;
+        if (popup) updatePopupSearch();
+        else updateSearch();
+    }
 }
 
 void QuickOpen::showSearchScopeMenu(HWND owner, POINT screenPoint)
@@ -2128,7 +3507,8 @@ void QuickOpen::showSearchScopeMenu(HWND owner, POINT screenPoint)
     _scopeMenuContainers.clear();
     _nextScopeMenuId = 50000;
 
-    AppendMenuW(menu, MF_STRING | (_searchDisabledPaths.empty() ? MF_CHECKED : 0), 49999, L"Pesquisar em tudo");
+    AppendMenuW(menu, MF_STRING | ((_searchIncludedPaths.empty() && _searchDisabledPaths.empty()) ? MF_CHECKED : 0),
+                49999, L"Pesquisar em tudo");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
 
     auto addFolderItem = [&](const std::filesystem::path& folder, const std::wstring& label)
@@ -2136,8 +3516,8 @@ void QuickOpen::showSearchScopeMenu(HWND owner, POINT screenPoint)
         if (_nextScopeMenuId >= 59900) return;
         const UINT id = _nextScopeMenuId++;
         _scopeMenuFolders[id] = folder;
-        const bool disabled = _searchDisabledPaths.find(folder.wstring()) != _searchDisabledPaths.end();
-        AppendMenuW(menu, MF_STRING | (disabled ? MF_UNCHECKED : MF_CHECKED), id, label.c_str());
+        const bool enabled = isPathEnabledForScope(folder, _searchIncludedPaths, _searchDisabledPaths);
+        AppendMenuW(menu, MF_STRING | (enabled ? MF_CHECKED : MF_UNCHECKED), id, label.c_str());
     };
 
     for (size_t i = 0; i < _containers.size(); ++i)
@@ -2148,7 +3528,7 @@ void QuickOpen::showSearchScopeMenu(HWND owner, POINT screenPoint)
         size_t enabledCount = 0;
         for (const auto& folder : c.folders)
         {
-            if (_searchDisabledPaths.find(folder.wstring()) == _searchDisabledPaths.end()) ++enabledCount;
+            if (isPathEnabledForScope(folder, _searchIncludedPaths, _searchDisabledPaths)) ++enabledCount;
             addFolderItem(folder, folder.filename().wstring().empty() ? folder.wstring() : folder.filename().wstring());
             // Move the last generated item from the main menu into this submenu.
             const UINT id = _nextScopeMenuId - 1;
@@ -2157,7 +3537,7 @@ void QuickOpen::showSearchScopeMenu(HWND owner, POINT screenPoint)
             wchar_t text[1024]{};
             GetMenuStringW(menu, id, text, static_cast<int>(std::size(text)), MF_BYCOMMAND);
             mi.wID = id;
-            mi.fState = (_searchDisabledPaths.find(folder.wstring()) == _searchDisabledPaths.end()) ? MFS_CHECKED : MFS_UNCHECKED;
+            mi.fState = isPathEnabledForScope(folder, _searchIncludedPaths, _searchDisabledPaths) ? MFS_CHECKED : MFS_UNCHECKED;
             mi.dwTypeData = text;
             DeleteMenu(menu, id, MF_BYCOMMAND);
             InsertMenuItemW(sub, 0xFFFFFFFF, TRUE, &mi);
@@ -2178,11 +3558,11 @@ void QuickOpen::showSearchScopeMenu(HWND owner, POINT screenPoint)
     const int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screenPoint.x, screenPoint.y, 0, owner, nullptr);
     if (cmd == 49999)
     {
+        _searchIncludedPaths.clear();
         _searchDisabledPaths.clear();
         _searchQueryGeneration.fetch_add(1);
         writeWorkspaceFile();
-        if (_searchOnly) updateSearch();
-        if (_searchPopup && IsWindowVisible(_searchPopup)) updatePopupSearch();
+        markSearchPending(owner == _searchPopup);
     }
     else if (cmd >= 50000 && cmd < 60000)
     {
@@ -2195,25 +3575,28 @@ void QuickOpen::showSearchScopeMenu(HWND owner, POINT screenPoint)
 
 void QuickOpen::applySearchScopeCommand(UINT id)
 {
-    if (id == 49999) { _searchDisabledPaths.clear(); }
+    if (id == 49999) { _searchIncludedPaths.clear(); _searchDisabledPaths.clear(); }
     else if (auto it = _scopeMenuFolders.find(id); it != _scopeMenuFolders.end())
     {
         const std::wstring key = it->second.wstring();
-        if (!_searchDisabledPaths.insert(key).second) _searchDisabledPaths.erase(key);
-    }
-    else if (auto it = _scopeMenuContainers.find(id); it != _scopeMenuContainers.end())
-    {
-        if (it->second < _containers.size())
+        if (!_searchIncludedPaths.empty())
         {
-            const auto& c = _containers[it->second];
-            bool allDisabled = !c.folders.empty();
+            if (!_searchIncludedPaths.insert(key).second) _searchIncludedPaths.erase(key);
+        }
+        else
+        {
+            if (!_searchDisabledPaths.insert(key).second) _searchDisabledPaths.erase(key);
+        }
+    }
+    else if (auto containerIt = _scopeMenuContainers.find(id); containerIt != _scopeMenuContainers.end())
+    {
+        if (containerIt->second < _containers.size())
+        {
+            const auto& c = _containers[containerIt->second];
+            _searchIncludedPaths.clear();
+            _searchDisabledPaths.clear();
             for (const auto& folder : c.folders)
-                if (_searchDisabledPaths.find(folder.wstring()) == _searchDisabledPaths.end()) { allDisabled = false; break; }
-            for (const auto& folder : c.folders)
-            {
-                if (allDisabled) _searchDisabledPaths.erase(folder.wstring());
-                else _searchDisabledPaths.insert(folder.wstring());
-            }
+                _searchIncludedPaths.insert(folder.wstring());
         }
     }
     // Changing scope only changes filtering; the file index itself remains
@@ -2221,8 +3604,7 @@ void QuickOpen::applySearchScopeCommand(UINT id)
     // click stall the UI and caused unnecessary disk traversal.
     _searchQueryGeneration.fetch_add(1);
     writeWorkspaceFile();
-    if (_searchOnly) updateSearch();
-    if (_searchPopup && IsWindowVisible(_searchPopup)) updatePopupSearch();
+    markSearchPending(_searchPopup && IsWindowVisible(_searchPopup));
 }
 
 void QuickOpen::searchDirectory(const std::filesystem::path& root, const std::wstring& query,
@@ -2259,154 +3641,32 @@ void QuickOpen::searchDirectory(const std::filesystem::path& root, const std::ws
         std::wstring folder = folderPath.empty() ? L"\\" : L"\\" + folderPath.wstring();
         // Normalize the folder separator for a stable Windows presentation.
         std::replace(folder.begin(), folder.end(), L'/', L'\\');
-        bool match = false;
-        if (!query.empty() && query.front() == L'>')
-        {
-            const std::wstring contentQuery = query.substr(1);
-            // Content search is intentionally delayed until at least two
-            // characters are present; this prevents a full workspace scan
-            // while the user is still typing the first character.
-            match = contentQuery.size() >= 2 && fileContainsText(p, contentQuery);
-        }
-        else
-        {
-            match = fuzzyScore(query, file) >= 0 || fuzzyScore(query, rel) >= 0;
-        }
+        const bool match = fuzzyScore(query, file) >= 0 || fuzzyScore(query, rel) >= 0;
         if (match) results.push_back({p, file, folder, rel});
     }
 }
 
-bool QuickOpen::fileContainsText(const std::filesystem::path& file, const std::wstring& query) const
+void QuickOpen::markSearchPending(bool popup)
 {
-    if (query.size() < 2) return false;
-
-    const std::wstring ext = lower(file.extension().wstring());
-    static const std::array<const wchar_t*, 30> textExts = {
-        L".txt", L".ini", L".cfg", L".conf", L".log", L".xml", L".json", L".csv",
-        L".cpp", L".h", L".hpp", L".c", L".cc", L".cxx", L".ixx", L".inl",
-        L".py", L".lua", L".js", L".ts", L".tsx", L".css", L".html", L".htm",
-        L".md", L".yaml", L".yml", L".bat", L".cmd", L".rc"
-    };
-    bool allowed = false;
-    for (const auto* e : textExts)
-        if (ext == e) { allowed = true; break; }
-    if (!allowed) return false;
-
-    std::error_code ec;
-    const auto size = std::filesystem::file_size(file, ec);
-    if (ec || size == 0 || size > MAX_CONTENT_FILE_SIZE) return false;
-
-    std::ifstream in(file, std::ios::binary);
-    if (!in) return false;
-
-    // Read only the prefix first. This avoids wasting time decoding binary files
-    // that happen to have a source-like extension.
-    std::array<unsigned char, 4096> probe{};
-    in.read(reinterpret_cast<char*>(probe.data()), static_cast<std::streamsize>(probe.size()));
-    const std::streamsize probeSize = in.gcount();
-    if (probeSize <= 0) return false;
-    size_t zeroCount = 0;
-    for (std::streamsize i = 0; i < probeSize; ++i)
-        if (probe[static_cast<size_t>(i)] == 0) ++zeroCount;
-    if (zeroCount > 8 && probe[0] != 0xFF) return false;
-    in.clear();
-    in.seekg(0, std::ios::beg);
-
-    const std::string utf8Needle = utf8FromWide(query);
-    if (utf8Needle.empty()) return false;
-
-    auto asciiFold = [](unsigned char c) -> unsigned char
+    _pendingContentQuery.clear();
+    _pendingContentPopup = false;
+    _runSearchAfterIndexBuild = false;
+    _runSearchAfterIndexPopup = false;
+    if (_searchQueryRunning)
     {
-        return (c >= 'A' && c <= 'Z') ? static_cast<unsigned char>(c + ('a' - 'A')) : c;
-    };
-
-    auto containsBytes = [&](const std::vector<unsigned char>& data,
-                             const std::string& needle,
-                             bool asciiInsensitive) -> bool
-    {
-        if (needle.empty() || data.size() < needle.size()) return false;
-        const size_t m = needle.size();
-        size_t skip[256];
-        for (size_t i = 0; i < 256; ++i) skip[i] = m;
-        for (size_t i = 0; i + 1 < m; ++i)
-        {
-            const unsigned char c = static_cast<unsigned char>(needle[i]);
-            skip[c] = m - 1 - i;
-            if (asciiInsensitive)
-                skip[asciiFold(c)] = m - 1 - i;
-        }
-        for (size_t pos = 0; pos + m <= data.size(); )
-        {
-            size_t j = m;
-            while (j > 0)
-            {
-                const unsigned char a = data[pos + j - 1];
-                const unsigned char b = static_cast<unsigned char>(needle[j - 1]);
-                if ((asciiInsensitive ? asciiFold(a) : a) != (asciiInsensitive ? asciiFold(b) : b))
-                    break;
-                --j;
-            }
-            if (j == 0) return true;
-            const unsigned char tail = data[pos + m - 1];
-            pos += skip[asciiInsensitive ? asciiFold(tail) : tail];
-        }
-        return false;
-    };
-
-    // UTF-8/ASCII is by far the common case. Search bytes directly with a
-    // Boyer-Moore-Horspool style skip table instead of decoding/lowercasing every
-    // megabyte of every file.
-    const bool asciiQuery = std::all_of(utf8Needle.begin(), utf8Needle.end(),
-        [](unsigned char c) { return c < 0x80; });
-    std::string byteNeedle = utf8Needle;
-    if (asciiQuery)
-        for (char& c : byteNeedle) c = static_cast<char>(asciiFold(static_cast<unsigned char>(c)));
-
-    std::vector<unsigned char> buffer(CONTENT_CHUNK_SIZE);
-    std::vector<unsigned char> carry;
-    carry.reserve(byteNeedle.size() > 1 ? byteNeedle.size() - 1 : 0);
-
-    bool firstChunk = true;
-    while (in)
-    {
-        in.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
-        const std::streamsize got = in.gcount();
-        if (got <= 0) break;
-
-        std::vector<unsigned char> data;
-        data.reserve(carry.size() + static_cast<size_t>(got));
-        data.insert(data.end(), carry.begin(), carry.end());
-        data.insert(data.end(), buffer.begin(), buffer.begin() + got);
-
-        // UTF-8 / ANSI search. For non-ASCII queries this is exact byte matching;
-        // ASCII queries are case-insensitive without Unicode decoding overhead.
-        if (containsBytes(data, byteNeedle, asciiQuery)) return true;
-
-        // UTF-16LE files are common in Windows tooling. Search their native bytes
-        // as a second fast path.
-        if (firstChunk && data.size() >= 2 && data[0] == 0xFF && data[1] == 0xFE)
-        {
-            const std::string wideNeedle = std::string(reinterpret_cast<const char*>(query.data()),
-                                                       query.size() * sizeof(wchar_t));
-            if (containsBytes(data, wideNeedle, false)) return true;
-        }
-
-        const size_t keep = (std::max)(size_t(1), byteNeedle.size() > 1 ? byteNeedle.size() - 1 : 1);
-        if (data.size() > keep)
-            carry.assign(data.end() - static_cast<std::ptrdiff_t>(keep), data.end());
-        else
-            carry = std::move(data);
-        firstChunk = false;
+        _searchQueryGeneration.fetch_add(1);
+        EnableWindow(_cancelSearch, FALSE);
     }
-    return false;
-}
 
-void QuickOpen::scheduleSearch(bool popup)
-{
-    HWND target = popup ? _searchPopup : _window;
-    if (!target) return;
-    KillTimer(target, SEARCH_DEBOUNCE_TIMER);
-    SetTimer(target, SEARCH_DEBOUNCE_TIMER, SEARCH_DEBOUNCE_MS, nullptr);
+    if (_searchProgressText) SetWindowTextW(_searchProgressText, L"Pressione Pesquisar ou Enter");
+    if (popup)
+    {
+        if (_searchPopupHint) SetWindowTextW(_searchPopupHint, L"Enter pesquisar  |  Na lista: Enter abrir  |  Esc fechar");
+    }
+    else if (_searchOnly)
+    {
+        SetWindowTextW(_status, L"Pressione Pesquisar ou Enter para buscar");
+    }
 }
 
 void QuickOpen::updateSearch()
@@ -2418,9 +3678,16 @@ void QuickOpen::updateSearch()
 
     if (query.empty())
     {
+        if (!_contentSearchPopup) cancelContentSearch();
         _searchOnly = false;
-        ShowWindow(_results, SW_HIDE);
-        ShowWindow(_tree, SW_SHOW);
+        _searchResults.clear();
+        _contentSearchGroups.clear();
+        _contentSearchGroupByPath.clear();
+        ListView_DeleteAllItems(_results);
+        configureResultsColumns(_results, false);
+        showFoldersPanel();
+        if (_searchProgress) SendMessageW(_searchProgress, PBM_SETPOS, 0, 0);
+        if (_searchProgressText) SetWindowTextW(_searchProgressText, L"Pronto");
         return;
     }
 
@@ -2429,23 +3696,34 @@ void QuickOpen::updateSearch()
 
 void QuickOpen::showSearchResults(const std::wstring& query)
 {
-    if (!_searchIndexValid)
+    if (isContentSearchEnabled(false))
     {
-        if (!_searchIndexBuilding) startSearchIndexBuild();
         _searchOnly = true;
-        ShowWindow(_tree, SW_HIDE);
-        ShowWindow(_results, SW_SHOW);
-        SetWindowTextW(_status, L"Indexando arquivos... aguarde");
+        showResultsPanel();
+        resetContentSearchResults(false);
+        if (query.size() < 2)
+        {
+            cancelContentSearch();
+            SetWindowTextW(_status, L"Digite ao menos 2 caracteres para pesquisar dentro dos arquivos");
+            if (_searchProgressText) SetWindowTextW(_searchProgressText, L"Aguardando termo de pesquisa");
+            return;
+        }
+        startContentSearch(query, false);
+        SetWindowTextW(_status, L"Pesquisando conteúdo...");
         return;
     }
 
-    if (!query.empty() && query.front() == L'>')
+    cancelContentSearch();
+    configureResultsColumns(_results, false);
+
+    if (!_searchIndexValid)
     {
+        if (!_searchIndexBuilding) startSearchIndexBuild();
+        _runSearchAfterIndexBuild = true;
+        _runSearchAfterIndexPopup = false;
         _searchOnly = true;
-        ShowWindow(_tree, SW_HIDE);
-        ShowWindow(_results, SW_SHOW);
-        startContentSearch(query, false);
-        SetWindowTextW(_status, _searchQueryRunning ? L"Pesquisando conteúdo..." : L"Preparando pesquisa de conteúdo...");
+        showResultsPanel();
+        SetWindowTextW(_status, L"Indexando arquivos... aguarde");
         return;
     }
 
@@ -2493,7 +3771,7 @@ void QuickOpen::showSearchResults(const std::wstring& query)
         ListView_SetItemText(_results, static_cast<int>(i), 2, const_cast<LPWSTR>(fullPath.c_str()));
     }
     _searchOnly = true;
-    ShowWindow(_tree, SW_HIDE); ShowWindow(_results, SW_SHOW);
+    showResultsPanel();
     if (!_searchResults.empty())
         ListView_SetItemState(_results, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
     SetWindowTextW(_status, (std::to_wstring(_searchResults.size()) + L" resultado(s)  •  Enter abrir  •  Esc limpar pesquisa").c_str());
@@ -2501,23 +3779,26 @@ void QuickOpen::showSearchResults(const std::wstring& query)
 
 void QuickOpen::clearSearchResults()
 {
-    if (_window) KillTimer(_window, SEARCH_DEBOUNCE_TIMER);
+    cancelContentSearch();
     _suppressSearch = true;
     SetWindowTextW(_search, L"");
     _suppressSearch = false;
     _searchResults.clear();
+    _contentSearchGroups.clear();
+    _contentSearchGroupByPath.clear();
+    configureResultsColumns(_results, false);
     ListView_DeleteAllItems(_results);
-    ShowWindow(_results, SW_HIDE);
-    ShowWindow(_tree, SW_SHOW);
-    SetFocus(_tree);
+    _searchOnly = false;
+    showFoldersPanel();
+    if (_searchProgress) SendMessageW(_searchProgress, PBM_SETPOS, 0, 0);
+    if (_searchProgressText) SetWindowTextW(_searchProgressText, L"Pronto");
 }
 
 void QuickOpen::openSearchResult()
 {
     const int row = ListView_GetNextItem(_results, -1, LVNI_SELECTED);
     if (row < 0 || row >= static_cast<int>(_searchResults.size())) return;
-    const std::wstring path = _searchResults[static_cast<size_t>(row)].path.wstring();
-    SendMessageW(_npp, NPPM_DOOPEN, 0, reinterpret_cast<LPARAM>(path.c_str()));
+    openSearchResultRow(_searchResults[static_cast<size_t>(row)]);
 }
 
 void QuickOpen::createContainer(POINT screenPoint)
@@ -2537,7 +3818,7 @@ void QuickOpen::createContainer(POINT screenPoint)
         name = base + L" " + std::to_wstring(suffix++);
     }
 
-    _containers.push_back({name, {}});
+    _containers.push_back({name, {}, defaultContainerColor(_containers.size())});
     writeWorkspaceFile();
     rebuildWorkspaceTree(false);
 }
@@ -2561,6 +3842,32 @@ void QuickOpen::renameContainer(size_t index)
     _containers[index].name = name;
     writeWorkspaceFile();
     rebuildWorkspaceTree(false);
+}
+
+void QuickOpen::colorContainer(size_t index)
+{
+    if (index >= _containers.size()) return;
+
+    static COLORREF customColors[16] = {
+        RGB(86, 156, 214), RGB(78, 201, 176), RGB(206, 145, 120), RGB(220, 220, 170),
+        RGB(197, 134, 192), RGB(181, 206, 168), RGB(244, 166, 88), RGB(114, 159, 207),
+        RGB(156, 220, 254), RGB(215, 186, 125), RGB(198, 120, 221), RGB(97, 175, 239),
+        RGB(152, 195, 121), RGB(224, 108, 117), RGB(229, 192, 123), RGB(86, 182, 194)
+    };
+
+    CHOOSECOLORW cc{};
+    cc.lStructSize = sizeof(cc);
+    cc.hwndOwner = _window;
+    cc.lpCustColors = customColors;
+    cc.rgbResult = _containers[index].color == CLR_INVALID
+        ? defaultContainerColor(index)
+        : _containers[index].color;
+    cc.Flags = CC_FULLOPEN | CC_RGBINIT;
+    if (!ChooseColorW(&cc)) return;
+
+    _containers[index].color = cc.rgbResult;
+    writeWorkspaceFile();
+    InvalidateRect(_tree, nullptr, FALSE);
 }
 
 void QuickOpen::removeContainer(size_t index)
@@ -2659,8 +3966,11 @@ void QuickOpen::newWorkspace()
 
     _savedRoots.clear();
     _containers.clear();
-    _workspaceFile.clear();
+    _searchIncludedPaths.clear();
+    _searchDisabledPaths.clear();
+    _workspaceFile = getWorkspaceFilePath();
     clearSearchResults();
+    writeWorkspaceFile();
     rebuildWorkspaceTree(false);
     saveSettings();
 }
@@ -2731,6 +4041,9 @@ bool QuickOpen::loadContainersFromJson(const std::wstring& json, std::vector<Wor
         WorkspaceContainer container;
         if (!extractJsonString(object, L"name", container.name) || container.name.empty())
             continue;
+        std::wstring colorText;
+        if (!extractJsonString(object, L"color", colorText) || !parseHexColor(colorText, container.color))
+            container.color = defaultContainerColor(containers.size());
         std::vector<std::wstring> folders;
         if (extractJsonStringArray(object, L"folders", folders))
         {
@@ -2768,7 +4081,9 @@ bool QuickOpen::writeWorkspaceFile()
     for (size_t i = 0; i < _containers.size(); ++i)
     {
         const auto& container = _containers[i];
-        json << L"      {\"name\": \"" << jsonEscape(container.name) << L"\", \"folders\": [";
+        const COLORREF color = container.color == CLR_INVALID ? defaultContainerColor(i) : container.color;
+        json << L"      {\"name\": \"" << jsonEscape(container.name) << L"\", \"color\": \""
+             << colorToHex(color) << L"\", \"folders\": [";
         for (size_t j = 0; j < container.folders.size(); ++j)
         {
             if (j) json << L", ";
@@ -2776,6 +4091,15 @@ bool QuickOpen::writeWorkspaceFile()
         }
         json << L"]}";
         if (i + 1 < _containers.size()) json << L',';
+        json << L"\n";
+    }
+    json << L"    ],\n";
+    json << L"    \"searchIncluded\": [\n";
+    size_t includedWritten = 0;
+    for (const auto& included : _searchIncludedPaths)
+    {
+        json << L"      \"" << jsonEscape(included) << L"\"";
+        if (++includedWritten < _searchIncludedPaths.size()) json << L',';
         json << L"\n";
     }
     json << L"    ],\n";
@@ -2854,6 +4178,8 @@ bool QuickOpen::loadWorkspaceFile(const std::wstring& filePath)
 
     std::vector<WorkspaceContainer> containers;
     loadContainersFromJson(json, containers);
+    std::vector<std::wstring> includedSearch;
+    extractJsonStringArray(json, L"searchIncluded", includedSearch);
     std::vector<std::wstring> disabledSearch;
     extractJsonStringArray(json, L"searchDisabled", disabledSearch);
 
@@ -2876,6 +4202,8 @@ bool QuickOpen::loadWorkspaceFile(const std::wstring& filePath)
     // Only replace the current workspace after the file was parsed successfully.
     _savedRoots = std::move(loaded);
     _containers = std::move(containers);
+    _searchIncludedPaths.clear();
+    for (const auto& path : includedSearch) if (!path.empty()) _searchIncludedPaths.insert(path);
     _searchDisabledPaths.clear();
     for (const auto& path : disabledSearch) if (!path.empty()) _searchDisabledPaths.insert(path);
     _workspaceFile = filePath;
@@ -2889,9 +4217,19 @@ bool QuickOpen::loadWorkspaceFile(const std::wstring& filePath)
 void QuickOpen::loadWorkspace()
 {
     _savedRoots.clear();
+    _containers.clear();
+    _searchIncludedPaths.clear();
+    _searchDisabledPaths.clear();
     if (_workspaceFile.empty()) _workspaceFile = getWorkspaceFilePath();
     if (std::filesystem::exists(_workspaceFile))
+    {
         loadWorkspaceFile(_workspaceFile);
+    }
+    else
+    {
+        writeWorkspaceFile();
+        saveSettings();
+    }
 }
 
 std::vector<std::filesystem::path> QuickOpen::getWorkspaceRootsForPanel() const
@@ -2926,6 +4264,13 @@ std::wstring QuickOpen::getWorkspaceFilePath() const
 
 void QuickOpen::loadSettings()
 {
+    std::wstring registryWorkspace;
+    if (readWorkspacePathFromRegistry(registryWorkspace))
+    {
+        _workspaceFile = registryWorkspace;
+        return;
+    }
+
     std::ifstream in(getSettingsPath(), std::ios::binary);
     std::string line;
     bool first = true;
@@ -2945,6 +4290,9 @@ void QuickOpen::loadSettings()
 
 void QuickOpen::saveSettings() const
 {
+    if (!_workspaceFile.empty())
+        writeWorkspacePathToRegistry(_workspaceFile);
+
     const std::wstring path = getSettingsPath();
     std::error_code ec;
     std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
@@ -3021,9 +4369,10 @@ void QuickOpen::applyTheme()
     SendMessageW(_npp, NPPM_DARKMODESUBCLASSANDTHEME,
                  static_cast<WPARAM>(NppDarkMode::dmfInit), reinterpret_cast<LPARAM>(_window));
 
-    for (HWND h : {_searchGroup, _workspaceGroup, _search, _searchScopeButton, _tree, _results,
+    for (HWND h : {_searchGroup, _workspaceGroup, _search, _runSearch, _contentSearchCheck, _searchProgress,
+                   _searchProgressText, _cancelSearch, _searchScopeButton, _tree, _results,
                    _addFolder, _newWorkspace, _saveWorkspace, _openWorkspace, _removeFolder,
-                   _expandAll, _collapseAll, _createContainer, _status})
+                   _expandAll, _collapseAll, _createContainer, _viewFolders, _viewSearch, _status})
     {
         if (!h) continue;
         if (_darkMode)
@@ -3051,13 +4400,13 @@ void QuickOpen::applyTheme()
         }
         if (_darkMode)
         {
-            for (HWND h : {_searchPopupEdit, _searchPopupScopeButton, _searchPopupResults})
+            for (HWND h : {_searchPopupEdit, _searchPopupRunSearch, _searchPopupContentCheck, _searchPopupScopeButton, _searchPopupResults, _searchPopupHint})
                 if (h) SendMessageW(_npp, NPPM_DARKMODESUBCLASSANDTHEME,
                                     static_cast<WPARAM>(NppDarkMode::dmfHandleChange), reinterpret_cast<LPARAM>(h));
         }
         else
         {
-            for (HWND h : {_searchPopupEdit, _searchPopupScopeButton, _searchPopupResults})
+            for (HWND h : {_searchPopupEdit, _searchPopupRunSearch, _searchPopupContentCheck, _searchPopupScopeButton, _searchPopupResults, _searchPopupHint})
                 if (h) SetWindowTheme(h, L"Explorer", nullptr);
         }
     }
@@ -3119,9 +4468,7 @@ LRESULT QuickOpen::handleMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
     {
         auto* info = reinterpret_cast<MINMAXINFO*>(l);
         // The panel itself is a child of Notepad++'s docking host. Applying
-        // limits here keeps layout responsive while the host limits the real
-        // resize operation. Docked mode constrains width only; floating mode
-        // constrains both dimensions.
+        // limits here keeps the layout usable in docked and floating modes.
         clampWorkspaceMinMaxInfo(h, info);
         return 0;
     }
@@ -3141,8 +4488,14 @@ LRESULT QuickOpen::handleMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
     case WM_SEARCH_INDEX_READY:
         finishSearchIndexBuild(reinterpret_cast<std::vector<SearchResult>*>(l));
         return 0;
-    case WM_SEARCH_INDEX_READY + 1:
-        finishContentSearch(reinterpret_cast<std::vector<SearchResult>*>(l), w != 0);
+    case WM_CONTENT_SEARCH_BATCH:
+        applyContentSearchBatch(reinterpret_cast<ContentSearchBatch*>(l));
+        return 0;
+    case WM_CONTENT_SEARCH_PROGRESS:
+        updateContentSearchProgress(reinterpret_cast<ContentSearchProgress*>(l));
+        return 0;
+    case WM_CONTENT_SEARCH_DONE:
+        completeContentSearch(reinterpret_cast<ContentSearchComplete*>(l));
         return 0;
 
     case WM_TIMER:
@@ -3153,12 +4506,6 @@ LRESULT QuickOpen::handleMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
             syncNativeFolderWorkspace();
             return 0;
         }
-        if (w == SEARCH_DEBOUNCE_TIMER)
-        {
-            KillTimer(h, SEARCH_DEBOUNCE_TIMER);
-            updateSearch();
-            return 0;
-        }
         break;
 
     case WM_COMMAND:
@@ -3167,9 +4514,24 @@ LRESULT QuickOpen::handleMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
         const int code = HIWORD(w);
         if (id == ID_SEARCH_SCOPE && code == BN_CLICKED)
         { POINT pt{}; GetCursorPos(&pt); showSearchScopeMenu(h, pt); return 0; }
+        if (id == ID_RUN_SEARCH && code == BN_CLICKED)
+        {
+            updateSearch();
+            return 0;
+        }
+        if (id == ID_CONTENT_SEARCH && code == BN_CLICKED)
+        {
+            setContentSearchEnabled(isButtonChecked(_contentSearchCheck));
+            return 0;
+        }
+        if (id == ID_CANCEL_SEARCH && code == BN_CLICKED)
+        {
+            cancelContentSearch();
+            return 0;
+        }
         if (id == ID_SEARCH && code == EN_CHANGE)
         {
-            scheduleSearch(false);
+            if (!_suppressSearch) markSearchPending(false);
             return 0;
         }
         if (id == ID_ADD) { addFolder(); return 0; }
@@ -3177,14 +4539,16 @@ LRESULT QuickOpen::handleMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
         if (id == ID_SAVE) { saveWorkspace(); return 0; }
         if (id == ID_OPEN) { openWorkspaceFile(); return 0; }
         if (id == ID_OPEN_SELECTED) {
-            if (_searchOnly) openSelectedResults(_results);
+            if (_resultsViewVisible) openSelectedResults(_results);
             else openSelectedTreeFiles();
             return 0;
         }
         if (id == ID_REMOVE) { removeSelectedRoot(); return 0; }
-        if (id == ID_EXPAND_ALL) { expandAllFolders(); return 0; }
-        if (id == ID_COLLAPSE_ALL) { collapseAllFolders(); return 0; }
+        if (id == ID_EXPAND_ALL) { if (_resultsViewVisible) expandAllContentGroups(); else expandAllFolders(); return 0; }
+        if (id == ID_COLLAPSE_ALL) { if (_resultsViewVisible) collapseAllContentGroups(); else collapseAllFolders(); return 0; }
         if (id == ID_CREATE_CONTAINER) { POINT pt{}; GetCursorPos(&pt); createContainer(pt); return 0; }
+        if (id == ID_VIEW_FOLDERS && code == BN_CLICKED) { showFoldersPanel(); return 0; }
+        if (id == ID_VIEW_SEARCH && code == BN_CLICKED) { showResultsPanel(); return 0; }
         if (id >= 50000 && id < 60000) { applySearchScopeCommand(static_cast<UINT>(id)); return 0; }
         break;
     }
@@ -3231,6 +4595,17 @@ LRESULT QuickOpen::handleMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
                         cd->clrTextBk = GetSysColor(COLOR_HIGHLIGHT);
                         cd->clrText = GetSysColor(COLOR_HIGHLIGHTTEXT);
                     }
+                    else if (TreeView_GetSelection(_tree) != item)
+                    {
+                        auto it = _nodeData.find(item);
+                        if (it != _nodeData.end() && it->second.type == NodeType::Container &&
+                            it->second.containerIndex < _containers.size())
+                        {
+                            const COLORREF color = _containers[it->second.containerIndex].color;
+                            if (color != CLR_INVALID)
+                                cd->clrText = color;
+                        }
+                    }
                     return CDRF_DODEFAULT;
                 }
             }
@@ -3270,6 +4645,18 @@ LRESULT QuickOpen::handleMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
         }
         else if (hdr->idFrom == ID_RESULTS)
         {
+            if (hdr->code == NM_CUSTOMDRAW)
+                return handleResultsCustomDraw(_results, reinterpret_cast<NMLVCUSTOMDRAW*>(const_cast<NMHDR*>(hdr)));
+            if (hdr->code == NM_CLICK)
+            {
+                const int row = ListView_GetNextItem(_results, -1, LVNI_SELECTED);
+                if (row >= 0 && row < static_cast<int>(_searchResults.size()) &&
+                    _searchResults[static_cast<size_t>(row)].rowType == SearchResult::RowType::ContentFile)
+                {
+                    toggleContentGroupFromRow(_results, row);
+                    return 0;
+                }
+            }
             if (hdr->code == NM_DBLCLK || hdr->code == NM_RETURN || hdr->code == LVN_ITEMACTIVATE)
             {
                 openSelectedResults(_results);
@@ -3302,14 +4689,15 @@ LRESULT QuickOpen::handleMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
         }
         if (w == VK_RETURN)
         {
-            if (_searchOnly) openSearchResult();
+            if (_resultsViewVisible) openSearchResult();
             else openTreeSelection();
             return 0;
         }
         break;
 
     case WM_SETFOCUS:
-        if (_searchOnly) SetFocus(_search);
+        if (_resultsViewVisible && _results) SetFocus(_results);
+        else if (_tree) SetFocus(_tree);
         break;
     }
 
@@ -3328,7 +4716,7 @@ LRESULT QuickOpen::handleEditMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
         if (msg == WM_KEYDOWN)
         {
             if (w == VK_ESCAPE) { hideSearchPopup(); return 0; }
-            if (w == VK_RETURN) { openSelectedResults(_searchPopupResults, true); return 0; }
+            if (w == VK_RETURN) { updatePopupSearch(); return 0; }
             if (w == VK_DOWN) { SetFocus(_searchPopupResults); return 0; }
         }
         return _oldPopupSearchProc ? CallWindowProcW(_oldPopupSearchProc, h, msg, w, l)
@@ -3338,8 +4726,8 @@ LRESULT QuickOpen::handleEditMessage(HWND h, UINT msg, WPARAM w, LPARAM l)
     if (msg == WM_KEYDOWN)
     {
         if (w == VK_ESCAPE) { clearSearchResults(); return 0; }
-        if (w == VK_RETURN && _searchOnly) { openSelectedResults(_results); return 0; }
-        if (w == VK_DOWN && _searchOnly) { SetFocus(_results); return 0; }
+        if (w == VK_RETURN) { updateSearch(); return 0; }
+        if (w == VK_DOWN && _resultsViewVisible) { SetFocus(_results); return 0; }
     }
     return _oldSearchProc ? CallWindowProcW(_oldSearchProc, h, msg, w, l)
                            : DefWindowProcW(h, msg, w, l);
@@ -3408,17 +4796,15 @@ LRESULT QuickOpen::handleSearchPopupMessage(HWND h, UINT msg, WPARAM w, LPARAM l
     case WM_SEARCH_INDEX_READY:
         finishSearchIndexBuild(reinterpret_cast<std::vector<SearchResult>*>(l));
         return 0;
-    case WM_SEARCH_INDEX_READY + 1:
-        finishContentSearch(reinterpret_cast<std::vector<SearchResult>*>(l), w != 0);
+    case WM_CONTENT_SEARCH_BATCH:
+        applyContentSearchBatch(reinterpret_cast<ContentSearchBatch*>(l));
         return 0;
-    case WM_TIMER:
-        if (w == SEARCH_DEBOUNCE_TIMER)
-        {
-            KillTimer(h, SEARCH_DEBOUNCE_TIMER);
-            updatePopupSearch();
-            return 0;
-        }
-        break;
+    case WM_CONTENT_SEARCH_PROGRESS:
+        updateContentSearchProgress(reinterpret_cast<ContentSearchProgress*>(l));
+        return 0;
+    case WM_CONTENT_SEARCH_DONE:
+        completeContentSearch(reinterpret_cast<ContentSearchComplete*>(l));
+        return 0;
     case WM_SIZE:
         layoutSearchPopup();
         return 0;
@@ -3432,23 +4818,45 @@ LRESULT QuickOpen::handleSearchPopupMessage(HWND h, UINT msg, WPARAM w, LPARAM l
     case WM_COMMAND:
         if (LOWORD(w) == ID_SEARCH_SCOPE && HIWORD(w) == BN_CLICKED)
         { POINT pt{}; GetCursorPos(&pt); showSearchScopeMenu(h, pt); return 0; }
+        if (LOWORD(w) == ID_POPUP_RUN_SEARCH && HIWORD(w) == BN_CLICKED)
+        {
+            updatePopupSearch();
+            return 0;
+        }
+        if (LOWORD(w) == ID_POPUP_CONTENT_SEARCH && HIWORD(w) == BN_CLICKED)
+        {
+            setContentSearchEnabled(isButtonChecked(_searchPopupContentCheck));
+            return 0;
+        }
+        if (LOWORD(w) == ID_POPUP_SEARCH && HIWORD(w) == EN_CHANGE)
+        {
+            markSearchPending(true);
+            return 0;
+        }
         if (LOWORD(w) == ID_OPEN_SELECTED)
         {
             openSelectedResults(_searchPopupResults, true);
             return 0;
         }
         if (LOWORD(w) >= 50000 && LOWORD(w) < 60000) { applySearchScopeCommand(static_cast<UINT>(LOWORD(w))); return 0; }
-        if (LOWORD(w) == ID_POPUP_SEARCH && HIWORD(w) == EN_CHANGE)
-        {
-            scheduleSearch(true);
-            return 0;
-        }
         break;
     case WM_NOTIFY:
     {
         const auto* hdr = reinterpret_cast<const NMHDR*>(l);
         if (hdr && hdr->idFrom == ID_POPUP_RESULTS)
         {
+            if (hdr->code == NM_CUSTOMDRAW)
+                return handleResultsCustomDraw(_searchPopupResults, reinterpret_cast<NMLVCUSTOMDRAW*>(const_cast<NMHDR*>(hdr)));
+            if (hdr->code == NM_CLICK)
+            {
+                const int row = ListView_GetNextItem(_searchPopupResults, -1, LVNI_SELECTED);
+                if (row >= 0 && row < static_cast<int>(_searchResults.size()) &&
+                    _searchResults[static_cast<size_t>(row)].rowType == SearchResult::RowType::ContentFile)
+                {
+                    toggleContentGroupFromRow(_searchPopupResults, row);
+                    return 0;
+                }
+            }
             if (hdr->code == NM_DBLCLK || hdr->code == NM_RETURN || hdr->code == LVN_ITEMACTIVATE)
             {
                 openSelectedResults(_searchPopupResults, true);
@@ -3482,6 +4890,10 @@ LRESULT QuickOpen::handleSearchPopupMessage(HWND h, UINT msg, WPARAM w, LPARAM l
         _searchPopup = nullptr;
         _searchPopupEdit = nullptr;
         _searchPopupResults = nullptr;
+        _searchPopupScopeButton = nullptr;
+        _searchPopupRunSearch = nullptr;
+        _searchPopupContentCheck = nullptr;
+        _searchPopupHint = nullptr;
         return 0;
     }
     return DefWindowProcW(h, msg, w, l);

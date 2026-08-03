@@ -18,6 +18,7 @@ std::wstring NPPWorkSpace_GetToggleShortcut();
 std::wstring NPPWorkSpace_GetSearchShortcut();
 void NPPWorkSpace_SetToggleShortcut(const std::wstring& value);
 void NPPWorkSpace_SetSearchShortcut(const std::wstring& value);
+HWND NPPWorkSpace_GetCurrentScintillaHandle();
 
 // Current Notepad++ docking API structure. Kept here so the plugin does not
 // need to link against Notepad++.exe or include Notepad++ private headers.
@@ -89,16 +90,21 @@ private:
         std::filesystem::path path;
         bool fromNppWorkspace{false};
         size_t containerIndex{static_cast<size_t>(-1)};
+        std::wstring label;
+        bool hasChildren{false};
     };
 
     struct WorkspaceContainer
     {
         std::wstring name;
         std::vector<std::filesystem::path> folders;
+        COLORREF color{CLR_INVALID};
     };
 
     struct SearchResult
     {
+        enum class RowType { FileName, ContentFile, ContentLine };
+
         std::filesystem::path path;
         std::wstring fileName;
         std::wstring folder;
@@ -106,6 +112,62 @@ private:
         // Cached lowercase keys keep interactive filename search allocation-free.
         std::wstring fileNameLower;
         std::wstring relativeLower;
+        RowType rowType{RowType::FileName};
+        size_t contentFileIndex{static_cast<size_t>(-1)};
+        size_t contentMatchIndex{static_cast<size_t>(-1)};
+        size_t lineNumber{};
+        std::wstring snippet;
+        size_t matchStart{};
+        size_t matchLength{};
+        size_t occurrenceOnLine{};
+        std::wstring matchText;
+    };
+
+    struct ContentMatch
+    {
+        size_t lineNumber{};
+        std::wstring snippet;
+        size_t matchStart{};
+        size_t matchLength{};
+        size_t occurrenceOnLine{};
+        std::wstring matchText;
+    };
+
+    struct ContentFileGroup
+    {
+        std::filesystem::path path;
+        std::wstring fileName;
+        std::wstring folder;
+        std::wstring relative;
+        std::vector<ContentMatch> matches;
+        bool collapsed{false};
+    };
+
+    struct ContentSearchBatch
+    {
+        unsigned int generation{};
+        bool popup{};
+        std::vector<ContentFileGroup> files;
+    };
+
+    struct ContentSearchProgress
+    {
+        unsigned int generation{};
+        bool popup{};
+        size_t processed{};
+        size_t total{};
+        size_t hits{};
+        std::wstring currentFile;
+    };
+
+    struct ContentSearchComplete
+    {
+        unsigned int generation{};
+        bool popup{};
+        bool cancelled{};
+        size_t processed{};
+        size_t total{};
+        size_t hits{};
     };
 
     static LRESULT CALLBACK windowProc(HWND, UINT, WPARAM, LPARAM);
@@ -142,6 +204,8 @@ private:
     void addNode(HWND tree, HTREEITEM parent, const std::wstring& label, const std::filesystem::path& path,
                  NodeType type, bool fromNppWorkspace, bool hasChildren, size_t containerIndex = static_cast<size_t>(-1));
     void expandNode(HTREEITEM item);
+    std::wstring formatTreeNodeLabel(const NodeData& data, bool expanded) const;
+    void refreshTreeNodeLabel(HTREEITEM item, bool expanded);
     void clearTreeData();
 
     std::vector<std::filesystem::path> getNppWorkspaceRoots() const;
@@ -163,13 +227,19 @@ private:
     void showTreeContextMenu(HTREEITEM item, POINT screenPoint);
     void createContainer(POINT screenPoint = POINT{-1, -1});
     void renameContainer(size_t index);
+    void colorContainer(size_t index);
     void removeContainer(size_t index);
     void moveFolderToContainer(const std::filesystem::path& folder, size_t containerIndex);
     void expandAllFolders();
     void collapseAllFolders();
+    void expandAllContentGroups();
+    void collapseAllContentGroups();
+    void showFoldersPanel();
+    void showResultsPanel();
+    void updatePanelSwitcher();
 
     void updateSearch();
-    void scheduleSearch(bool popup);
+    void markSearchPending(bool popup);
     void showSearchResults(const std::wstring& query);
     void clearSearchResults();
     void openSearchResult();
@@ -185,12 +255,25 @@ private:
     void startSearchIndexBuild();
     void finishSearchIndexBuild(std::vector<SearchResult>* built);
     void startContentSearch(const std::wstring& query, bool popup);
-    void finishContentSearch(std::vector<SearchResult>* found, bool popup);
+    void applyContentSearchBatch(ContentSearchBatch* batch);
+    void updateContentSearchProgress(ContentSearchProgress* progress);
+    void completeContentSearch(ContentSearchComplete* complete);
+    void cancelContentSearch();
+    bool isContentSearchEnabled(bool popup) const;
+    void setContentSearchEnabled(bool enabled);
+    void resetContentSearchResults(bool popup);
+    void configureResultsColumns(HWND list, bool contentMode);
+    void appendContentSearchGroup(ContentFileGroup&& group, HWND list);
+    void rebuildContentResultsList(HWND list);
+    void toggleContentGroupFromRow(HWND list, int row);
+    void openSearchResultRow(const SearchResult& result);
+    void openFileAtOccurrence(const SearchResult& result);
+    LRESULT handleResultsCustomDraw(HWND list, NMLVCUSTOMDRAW* customDraw);
+    void drawHighlightedSnippet(HWND list, NMLVCUSTOMDRAW* customDraw, const SearchResult& result);
     void openPopupSearchResult();
     void layoutSearchPopup();
     void searchDirectory(const std::filesystem::path& root, const std::wstring& query,
                          std::vector<SearchResult>& results, size_t limit) const;
-    bool fileContainsText(const std::filesystem::path& file, const std::wstring& query) const;
     void addDroppedFolders(HDROP drop);
     static int fuzzyScore(const std::wstring& query, const std::wstring& candidate);
     static int fuzzyScoreLower(const std::wstring& queryLower, const std::wstring& candidateLower);
@@ -236,8 +319,15 @@ private:
     HWND _createContainer{};
     HWND _status{};
     HWND _searchGroup{};
+    HWND _contentSearchCheck{};
+    HWND _searchProgress{};
+    HWND _searchProgressText{};
+    HWND _cancelSearch{};
+    HWND _runSearch{};
     HWND _searchScopeButton{};
     HWND _workspaceGroup{};
+    HWND _viewFolders{};
+    HWND _viewSearch{};
     HWND _tooltips{};
     HWND _dockHost{};
     WNDPROC _oldDockHostProc{};
@@ -251,6 +341,9 @@ private:
     HWND _searchPopupEdit{};
     HWND _searchPopupResults{};
     HWND _searchPopupScopeButton{};
+    HWND _searchPopupRunSearch{};
+    HWND _searchPopupContentCheck{};
+    HWND _searchPopupHint{};
 
     HFONT _font{};
     HFONT _titleFont{};
@@ -267,10 +360,13 @@ private:
     std::wstring _workspaceFile;
     std::vector<std::filesystem::path> _nppRoots;
     std::vector<SearchResult> _searchResults;
+    std::vector<ContentFileGroup> _contentSearchGroups;
+    std::unordered_map<std::wstring, size_t> _contentSearchGroupByPath;
     std::unordered_map<HTREEITEM, NodeData> _nodeData;
     std::unordered_set<HTREEITEM> _selectedTreeFiles;
 
-    // Search scope: empty means all workspace roots are enabled.
+    // Search scope: empty included/disabled sets mean all workspace roots are enabled.
+    std::unordered_set<std::wstring> _searchIncludedPaths;
     std::unordered_set<std::wstring> _searchDisabledPaths;
     std::unordered_map<UINT, std::filesystem::path> _scopeMenuFolders;
     std::unordered_map<UINT, size_t> _scopeMenuContainers;
@@ -290,11 +386,19 @@ private:
     bool _pendingContentPopup{false};
     std::wstring _runningContentQuery;
     bool _runningContentPopup{false};
+    bool _runSearchAfterIndexBuild{false};
+    bool _runSearchAfterIndexPopup{false};
     bool _searchIndexValid{false};
 
     bool _darkMode{false};
     bool _searchOnly{false};
+    bool _resultsViewVisible{false};
     bool _suppressSearch{false};
+    bool _searchInsideFiles{false};
+    bool _contentSearchPopup{false};
+    size_t _contentSearchProcessed{};
+    size_t _contentSearchTotal{};
+    size_t _contentSearchHits{};
     unsigned int _searchGeneration{0};
     bool _registeredDock{false};
     int _dockCommandId{0};

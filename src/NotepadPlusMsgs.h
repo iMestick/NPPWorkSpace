@@ -6,6 +6,7 @@
 #endif
 
 #define NPPM_MODELESSDIALOG             (NPPMSG + 12)
+#define NPPM_GETCURRENTSCINTILLA        (NPPMSG + 4)
 #define NPPM_DOOPEN                     (NPPMSG + 77)
 #define NPPM_ISDARKMODEENABLED          (NPPMSG + 107)
 #define NPPM_GETDARKMODECOLORS          (NPPMSG + 108)

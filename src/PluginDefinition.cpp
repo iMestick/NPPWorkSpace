@@ -81,6 +81,14 @@ void NPPWorkSpace_SetSearchShortcut(const std::wstring& value)
     setShortcutFromString(g_searchShortcut, value);
 }
 
+HWND NPPWorkSpace_GetCurrentScintillaHandle()
+{
+    int current = 0;
+    if (g_nppData._nppHandle)
+        SendMessageW(g_nppData._nppHandle, NPPM_GETCURRENTSCINTILLA, 0, reinterpret_cast<LPARAM>(&current));
+    return current == 1 ? g_nppData._scintillaSecondHandle : g_nppData._scintillaMainHandle;
+}
+
 extern "C" __declspec(dllexport) void setInfo(NppData data)
 {
     g_nppData = data;
