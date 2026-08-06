@@ -26,3 +26,6 @@ compile_commands.json
 # OS/editor files
 Thumbs.db
 .DS_Store
+
+# Local dependency bootstrap
+.deps/

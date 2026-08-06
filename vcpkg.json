@@ -1,0 +1,11 @@
+{
+  "name": "nppworkspace",
+  "version-string": "1.4.2",
+  "description": "Native Notepad++ workspace plugin with persistent SSH/SFTP support",
+  "dependencies": [
+    {
+      "name": "openssl",
+      "default-features": false
+    }
+  ]
+}
